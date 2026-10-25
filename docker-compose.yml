@@ -4,14 +4,13 @@ services:
     image: oakai/sovereign-vault:latest
     container_name: sovereign-vault
     restart: unless-stopped
+    network_mode: host
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     volumes:
       - vault-data:/data
-    ports:
-      - "8443:8443"
 
 volumes:
   vault-data:

@@ -74,4 +74,41 @@ impl Storage {
             Ok(None)
         }
     }
+
+    pub fn put_token(
+        &self,
+        token_id: &str,
+        token_hash: &str,
+        project: &str,
+        name: &str,
+        allowed_paths: &str,
+        capabilities: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO tokens (token_id, token_hash, project, name, allowed_paths, capabilities) VALUES (?, ?, ?, ?, ?, ?)",
+            params![token_id, token_hash, project, name, allowed_paths, capabilities],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_token_by_hash(&self, token_hash: &str) -> Result<Option<crate::acl::ScopedToken>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_id, token_hash, project, name, allowed_paths, capabilities FROM tokens WHERE token_hash = ?"
+        )?;
+        let mut rows = stmt.query(params![token_hash])?;
+        if let Some(row) = rows.next()? {
+            let paths_str: String = row.get(4)?;
+            let caps_str: String = row.get(5)?;
+            Ok(Some(crate::acl::ScopedToken {
+                token_id: row.get(0)?,
+                token_hash: row.get(1)?,
+                project: row.get(2)?,
+                name: row.get(3)?,
+                allowed_paths: serde_json::from_str(&paths_str).unwrap_or_else(|_| vec![paths_str]),
+                capabilities: serde_json::from_str(&caps_str).unwrap_or_else(|_| vec![caps_str]),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
 }

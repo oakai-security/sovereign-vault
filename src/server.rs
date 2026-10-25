@@ -43,11 +43,29 @@ pub struct PutSecretRequest {
     pub value: String,
 }
 
+#[derive(Deserialize)]
+pub struct EnrollTokenRequest {
+    pub project: String,
+    pub name: String,
+    pub allowed_paths: Vec<String>,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct EnrollTokenResponse {
+    pub token_id: String,
+    pub token: String,
+    pub project: String,
+    pub name: String,
+    pub allowed_paths: Vec<String>,
+}
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/sys/health", get(health_handler))
         .route("/v1/sys/init", post(init_handler))
         .route("/v1/sys/unseal", post(unseal_handler))
+        .route("/v1/sys/enroll", post(enroll_handler))
         .route("/v1/secret/*path", get(get_secret_handler).put(put_secret_handler))
         .with_state(state)
 }
@@ -124,8 +142,46 @@ async fn unseal_handler(
     Ok(Json(serde_json::json!({ "status": "unsealed", "sealed": false })))
 }
 
+async fn enroll_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<EnrollTokenRequest>,
+) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+    let key_guard = state.master_key.lock().unwrap();
+    if key_guard.is_none() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"));
+    }
+
+    // Generate random 128-bit token ID and 256-bit secret token
+    let mut tok_bytes = [0u8; 16];
+    let mut sec_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut tok_bytes);
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut sec_bytes);
+
+    let token_id = format!("tok_{}", hex::encode(tok_bytes));
+    let raw_token = format!("sv_live_{}", hex::encode(sec_bytes));
+    let token_hash = hex::encode(sec_bytes);
+
+    let paths_json = serde_json::to_string(&payload.allowed_paths).unwrap_or_else(|_| "[]".into());
+    let caps_json = serde_json::to_string(&payload.capabilities).unwrap_or_else(|_| "[]".into());
+
+    let storage = state.storage.lock().unwrap();
+    storage
+        .put_token(&token_id, &token_hash, &payload.project, &payload.name, &paths_json, &caps_json)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist token"))?;
+
+    Ok(Json(EnrollTokenResponse {
+        token_id,
+        token: raw_token,
+        project: payload.project,
+        name: payload.name,
+        allowed_paths: payload.allowed_paths,
+    }))
+}
+
 async fn get_secret_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
     let key_guard = state.master_key.lock().unwrap();
@@ -133,6 +189,22 @@ async fn get_secret_handler(
         Some(k) => k,
         None => return Err((StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed")),
     };
+
+    // If an X-Vault-Token header is provided, enforce project/path scoping
+    if let Some(tok_hdr) = headers.get("X-Vault-Token").and_then(|h| h.to_str().ok()) {
+        let raw_token_hex = tok_hdr.trim_start_matches("sv_live_");
+        let storage = state.storage.lock().unwrap();
+        match storage.get_token_by_hash(raw_token_hex).map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Token query error")
+        })? {
+            Some(tok) => {
+                if !tok.is_path_allowed(&path, "read") {
+                    return Err((StatusCode::FORBIDDEN, "Access forbidden: Path outside permitted token scope"));
+                }
+            }
+            None => return Err((StatusCode::UNAUTHORIZED, "Invalid machine token")),
+        }
+    }
 
     let storage = state.storage.lock().unwrap();
     let (ct, nonce_bytes) = match storage.get_secret(&path).map_err(|_| {
@@ -157,6 +229,7 @@ async fn get_secret_handler(
 
 async fn put_secret_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Path(path): Path<String>,
     Json(payload): Json<PutSecretRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
@@ -165,6 +238,22 @@ async fn put_secret_handler(
         Some(k) => k,
         None => return Err((StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed")),
     };
+
+    // If X-Vault-Token provided, verify write permission
+    if let Some(tok_hdr) = headers.get("X-Vault-Token").and_then(|h| h.to_str().ok()) {
+        let raw_token_hex = tok_hdr.trim_start_matches("sv_live_");
+        let storage = state.storage.lock().unwrap();
+        match storage.get_token_by_hash(raw_token_hex).map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Token query error")
+        })? {
+            Some(tok) => {
+                if !tok.is_path_allowed(&path, "write") {
+                    return Err((StatusCode::FORBIDDEN, "Access forbidden: Write outside permitted token scope"));
+                }
+            }
+            None => return Err((StatusCode::UNAUTHORIZED, "Invalid machine token")),
+        }
+    }
 
     let (ct, nonce) = encrypt_secret(key, payload.value.as_bytes()).map_err(|_| {
         (StatusCode::INTERNAL_SERVER_ERROR, "Cryptographic encryption failed")

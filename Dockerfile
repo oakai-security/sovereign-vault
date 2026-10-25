@@ -12,8 +12,10 @@ RUN cargo build --release
 # Distroless / minimal runtime
 FROM alpine:3.20
 
-# Run as unprivileged UID
-RUN addgroup -S vault && adduser -S vault -G vault -u 10001
+# Run as unprivileged UID and pre-create data directory with correct ownership
+RUN addgroup -S vault && adduser -S vault -G vault -u 10001 && \
+    mkdir -p /data && chown -R 10001:10001 /data
+
 USER 10001:10001
 
 WORKDIR /app
