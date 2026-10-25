@@ -2,7 +2,7 @@
 name = "sovereign-vault"
 version = "0.1.0"
 edition = "2021"
-authors = ["Curtis Powers <curtis@oakai-security.com>"]
+authors = ["Oakai Security <security@oakai-security.com>"]
 description = "Single-binary, zero-account, containerized Micro-KMS with encrypted volume storage and memory-safe unsealing."
 license = "Apache-2.0"
 repository = "https://github.com/oakai-security/sovereign-vault"

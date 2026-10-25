@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
 #[command(name = "sovereign-vault")]
-#[command(author = "Curtis Powers <curtis@oakai-security.com>")]
+#[command(author = "Oakai Security <security@oakai-security.com>")]
 #[command(version = "0.1.0")]
 #[command(about = "Sovereign Micro-KMS: Zero-account, encrypted volume secrets container", long_about = None)]
 struct Cli {
