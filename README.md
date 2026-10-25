@@ -1,76 +1,100 @@
-# Sovereign Vault
+# Sovereign Vault (v0.2)
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Organization](https://img.shields.io/badge/Org-oakai--security-orange.svg)](https://oakai-security.com)
-[![Specification](https://img.shields.io/badge/Spec-SPEC--014-green.svg)](docs/specs/014-sovereign-micro-kms-vault.md)
+[![Version](https://img.shields.io/badge/Version-0.2.0-purple.svg)](Cargo.toml)
 
-**Sovereign Vault** is a lightweight, single-binary, containerized **Micro-KMS (Key Management Service)** engineered for modern homelabs and sovereign edge infrastructure. It gives you the convenience of Caddy with enterprise-grade cryptographic guarantees.
+**Sovereign Vault** is a single-binary, zero-account, containerized **Micro-KMS (Key Management Service)** engineered for developer speed, sovereign edge deployments, and enterprise BYOC (Bring Your Own Cloud) operations.
 
 Part of the **Oakai Security** (`oakai-security.com`) suite.
 
 ---
 
-## Key Features
+## v0.2 Cryptographic & Operational Guarantees
 
-* **Zero Accounts / Zero Human Friction**: No user logins, no master passwords, no mandatory multi-tier organization signup wizards.
-* **Encrypted Volume Storage**: Single-file SQLite database persisted with authenticated AES-256-GCM AEAD encryption. Disk inspection reveals only opaque high-entropy ciphertext.
-* **First-Boot Nonce Guard**: Prevents port-hijacking race conditions by printing an ephemeral 64-character token strictly to container standard output.
-* **Memory Protection Enclave**:
-  * Pinned heap memory using `mlock()` prevents kernel swap page leaks to disk.
-  * Instant hardware-level memory scrubbing using Rust's `zeroize` on drop.
-  * `PR_SET_DUMPABLE = 0` blocks debugger attachments (`ptrace`/`gdb`) and core dumps.
-* **Path-Scoped Machine Tokens**: Fine-grained project ACLs (e.g. `apps/jellyfin/*`) ensure a compromised microservice cannot read other infrastructure credentials.
-* **Automated Unseal Watcher**: Client utility runs on an authorized node, checks health status, and automatically unseals the vault after system reboots using your host's local OS Credential Guard (`keyring`).
+* **Zero Plaintext Keys on Disk (`HKDF-SHA512` Envelope)**:
+  * Initialization generates a random 256-bit Master DEK wrapped with an `HKDF-SHA512` Key Encryption Key (KEK) under `AES-256-GCM` (`aad = "sovereign-vault:v2:envelope"`).
+  * `/data/vault.envelope` (`0600`) stores only salt, nonce, and wrapped DEK ciphertext. Unseal verifies the AEAD tag *before* opening storage (`401` on invalid key, `409` if already unsealed).
+* **Full-Database Encryption (`SQLCipher` + `HMAC_SHA512`)**:
+  * Every 4 KB SQLite page, table schema, secret path index, and WAL frame in `/data/vault.db` is encrypted via 256-bit SQLCipher (`PBKDF2_HMAC_SHA512` / `HMAC_SHA512`, `PRAGMA synchronous = FULL`).
+  * Secret values receive a second inner `AES-256-GCM` layer bound to canonical Associated Data (`sv:v2:{project}:{path}:{version}`), preventing row-swapping and preserving immutable version history (`secret_versions`).
+* **Post-Quantum-Resilient `SHA-512` Machine Tokens**:
+  * Machine tokens (`sv_live_<32hex_id>_<64hex_secret>`) carry 256 bits of CSPRNG entropy, are hashed at rest with `SHA-512`, and are verified in constant time (`subtle::ConstantTimeEq`).
+  * Default-deny authentication on every secret and administrative endpoint (`401` when missing/invalid).
+* **Canonical Path & Directory-Boundary ACLs**:
+  * Rejects `.` / `..` / `//` traversal segments (`400 Bad Request`) and enforces strict trailing-slash boundaries (`apps/jellyfin/*` grants `apps/jellyfin/db_pass` and denies `apps/jellyfin-prod/db_pass` with `403 Forbidden`).
+* **Dedicated RAM-Pinned Key Enclave**:
+  * `LockedKey` allocates page-aligned anonymous `mmap` memory pinned via `mlock()`, marked `MADV_DONTDUMP`, scrubbed via volatile `zeroize` prior to `munlock`/`munmap`, and guarded globally with `PR_SET_DUMPABLE = 0`.
+* **Zero-History CLI (`rpassword` + `--stdin`)**:
+  * No CLI flag accepts raw keys, tokens, or secrets on the command line, eliminating `~/.bash_history` and `ps aux` leakage. Pairs natively with Ubuntu Secret Service (`gnome-keyring` / Python `keyring`).
+* **100% Air-Gapped Standalone Default**:
+  * Standalone containers never initiate outbound connections. Enterprise Fleet heartbeat telemetry activates strictly when **both** `OAKAI_ENTERPRISE_LICENSE` and `OAKAI_TELEMETRY_ENABLED=true` are explicitly configured, reporting only aggregate counts (`total_secrets_count`, `active_tokens_count`, `storage_bytes`).
 
 ---
 
-## Architecture
+## Architecture (Reverse-Proxy TLS Pattern)
+
+In production and local deployments, `sovereign-vault` binds strictly to host loopback (`127.0.0.1:8443`). Your edge reverse proxy (Caddy, Nginx, Traefik, or Cloudflare Tunnel) terminates TLS (`https://vault.internal.company.com`) using ACME or corporate PKI certificates and forwards over loopback:
 
 ```mermaid
-flowchart TD
-    subgraph Host["Host Machine / Docker Daemon"]
-        Vault["sovereign-vault container (:8443)"]
-        Vol["Encrypted Storage Volume (/data/vault.db)"]
-        Vault <-->|AES-256-GCM| Vol
-    end
+flowchart LR
+    Workload["Workloads & Admin CLI"] -->|"HTTPS (TLS 1.3)"| Proxy["Caddy / Nginx Reverse Proxy"]
+    Proxy -->|"http://127.0.0.1:8443 (Host Loopback)"| Vault["sovereign-vault (:8443)"]
+    Vault <-->|"SQLCipher AES-256 + HMAC-SHA512"| Vol[("/data/vault.db + vault.envelope")]
+```
 
-    subgraph Clients["Workloads & Clients"]
-        ClientA["Jellyfin (Token Scoped: apps/jellyfin/*)"]
-        ClientB["AdGuard (Token Scoped: infra/dns/*)"]
-        Watcher["Watcher Daemon (Auto-unseals from OS keyring)"]
-    end
-
-    ClientA -->|GET /v1/secret/...| Vault
-    ClientB -->|GET /v1/secret/...| Vault
-    Watcher -->|POST /v1/sys/unseal| Vault
+Example `Caddyfile`:
+```caddyfile
+vault.internal.company.com {
+    reverse_proxy 127.0.0.1:8443
+}
 ```
 
 ---
 
-## Quickstart
+## Quickstart & Clean Rebuild Loop
 
-### 1. Launch with Docker Compose
+### 1. Destroy, Wipe, Rebuild & Auto-Init into Ubuntu Secret Service
+During active development or testing, tear down any existing container, wipe the encrypted volume, rebuild from source, and initialize directly into Ubuntu Secret Service (`gnome-keyring`) with zero shell history:
+
 ```bash
-docker compose up -d
+./scripts/rebuild_dev_vault.sh --auto-init
 ```
 
-### 2. Retrieve First-Boot Nonce
+*(Omit `--auto-init` if you want a clean uninitialized container to test manual `init` steps.)*
+
+### 2. Manual Zero-History Initialization
 ```bash
+# View the single-use first-boot nonce
 docker logs sovereign-vault | grep "Nonce:"
+
+# Run interactive hidden-TTY init (pasted nonce will NOT appear in terminal or ~/.bash_history)
+docker exec -it sovereign-vault sovereign-vault init
 ```
 
-### 3. Initialize the Vault
+### 3. Enroll a Scoped Machine Identity
 ```bash
-curl -X POST http://localhost:8443/v1/sys/init \
-  -H "X-Vault-Bootstrap-Nonce: <your_nonce_here>"
+python3 python3 -m keyring \
+  get sovereign-vault admin-token | \
+  docker exec -i sovereign-vault sovereign-vault token enroll \
+    --project jellyfin \
+    --name jellyfin-prod-01 \
+    --path "apps/jellyfin/*" \
+    --cap read --cap write \
+    --token-stdin
 ```
-*Save the generated 256-bit unseal key into your personal password manager or OS keyring.*
 
-### 4. Unseal After Reboot
+### 4. Seal & Auto-Unseal Verification
 ```bash
-curl -X POST http://localhost:8443/v1/sys/unseal \
-  -H "Content-Type: application/json" \
-  -d '{"unseal_key": "<your_unseal_key>"}'
+# Seal vault (drops SQLCipher connection & scrubs mlock'd RAM pages)
+python3 python3 -m keyring \
+  get sovereign-vault admin-token | \
+  docker exec -i sovereign-vault sovereign-vault seal --token-stdin
+
+# Unseal cleanly via stdin pipe from Ubuntu Secret Service
+python3 python3 -m keyring \
+  get sovereign-vault unseal-key | \
+  docker exec -i sovereign-vault sovereign-vault unseal --stdin
 ```
 
 ---
