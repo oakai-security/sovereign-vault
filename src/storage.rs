@@ -1,8 +1,12 @@
 //! SQLCipher 256-bit full-page encrypted SQLite persistence engine and `0600` envelope file I/O.
 
 use crate::acl::ScopedToken;
-use crate::crypto::{hex_encode, EnvelopeHeader, LockedKey};
+use crate::crypto::{
+    compute_audit_chain_mac, constant_time_str_eq, hex_encode, EnvelopeHeader, LockedKey,
+};
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,6 +16,7 @@ use zeroize::Zeroizing;
 
 const ENVELOPE_FILENAME: &str = "vault.envelope";
 const DB_FILENAME: &str = "vault.db";
+const AUDIT_GENESIS_MAC: &str = "GENESIS_SOVEREIGN_VAULT_V2";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -30,8 +35,47 @@ pub struct StoredSecretRecord {
     pub nonce: [u8; 12],
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretMetadataItem {
+    pub path: String,
+    pub project: String,
+    pub version: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenMetadataItem {
+    pub token_id: String,
+    pub project: String,
+    pub name: String,
+    pub allowed_paths: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub expires_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub seq: i64,
+    pub timestamp: i64,
+    pub event_type: String,
+    pub actor: String,
+    pub resource: String,
+    pub outcome: String,
+    pub prev_mac_sha512: String,
+    pub entry_mac_sha512: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupMetadata {
+    pub snapshot_id: String,
+    pub backup_dir: String,
+    pub total_bytes: u64,
+}
+
 pub struct Storage {
     conn: Connection,
+    data_dir: PathBuf,
     db_path: PathBuf,
 }
 
@@ -149,6 +193,17 @@ impl Storage {
                  capabilities TEXT NOT NULL,
                  expires_at INTEGER,
                  created_at INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS audit_log (
+                 seq INTEGER PRIMARY KEY,
+                 timestamp INTEGER NOT NULL,
+                 event_type TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 resource TEXT NOT NULL,
+                 outcome TEXT NOT NULL,
+                 prev_mac_sha512 TEXT NOT NULL,
+                 entry_mac_sha512 TEXT NOT NULL
              );",
         )?;
 
@@ -156,7 +211,11 @@ impl Storage {
         let _ = set_mode_0600(&data_dir.join("vault.db-wal"));
         let _ = set_mode_0600(&data_dir.join("vault.db-shm"));
 
-        Ok(Self { conn, db_path })
+        Ok(Self {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            db_path,
+        })
     }
 
     /// Return the next monotonic version number for `path` (starts at `1`).
@@ -333,4 +392,204 @@ impl Storage {
         let db_bytes = fs::metadata(&self.db_path).map(|m| m.len()).unwrap_or(0);
         Ok((secrets_count as u64, tokens_count as u64, db_bytes))
     }
+
+    /// List secret metadata rows (`path`, `project`, `version`, `updated_at`) without loading ciphertexts.
+    pub fn list_secrets_metadata(&self) -> Result<Vec<SecretMetadataItem>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, project, current_version, updated_at FROM secrets ORDER BY path ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SecretMetadataItem {
+                path: r.get(0)?,
+                project: r.get(1)?,
+                version: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        })?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    /// List enrolled machine token metadata without exposing SHA-512 digests.
+    pub fn list_tokens_metadata(&self) -> Result<Vec<TokenMetadataItem>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT token_id, project, name, allowed_paths, capabilities, expires_at, created_at
+             FROM tokens ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let paths_str: String = r.get(3)?;
+            let caps_str: String = r.get(4)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                paths_str,
+                caps_str,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (token_id, project, name, paths_str, caps_str, expires_at, created_at) = row?;
+            out.push(TokenMetadataItem {
+                token_id,
+                project,
+                name,
+                allowed_paths: serde_json::from_str(&paths_str)?,
+                capabilities: serde_json::from_str(&caps_str)?,
+                expires_at,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Append a tamper-evident, HMAC-SHA512 hash-chained audit event inside SQLCipher.
+    pub fn append_audit_event(
+        &mut self,
+        audit_key: &LockedKey,
+        event_type: &str,
+        actor: &str,
+        resource: &str,
+        outcome: &str,
+    ) -> Result<(), StorageError> {
+        let now = now_unix_seconds();
+        let tx = self.conn.transaction()?;
+        let last: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT seq, entry_mac_sha512 FROM audit_log ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        let (seq, prev_mac) = match last {
+            Some((last_seq, last_mac)) => (last_seq + 1, last_mac),
+            None => (1, AUDIT_GENESIS_MAC.to_string()),
+        };
+
+        let entry_mac = compute_audit_chain_mac(
+            audit_key,
+            &prev_mac,
+            seq,
+            now,
+            event_type,
+            actor,
+            resource,
+            outcome,
+        );
+
+        tx.execute(
+            "INSERT INTO audit_log (seq, timestamp, event_type, actor, resource, outcome, prev_mac_sha512, entry_mac_sha512)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Recompute and verify the entire HMAC-SHA512 hash chain from genesis (`seq = 1..=N`),
+    /// returning `(chain_verified, total_events, tail_events)`.
+    pub fn verify_and_list_audit_log(
+        &self,
+        audit_key: &LockedKey,
+        limit: usize,
+    ) -> Result<(bool, u64, Vec<AuditLogEntry>), StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, timestamp, event_type, actor, resource, outcome, prev_mac_sha512, entry_mac_sha512
+             FROM audit_log ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(AuditLogEntry {
+                seq: r.get(0)?,
+                timestamp: r.get(1)?,
+                event_type: r.get(2)?,
+                actor: r.get(3)?,
+                resource: r.get(4)?,
+                outcome: r.get(5)?,
+                prev_mac_sha512: r.get(6)?,
+                entry_mac_sha512: r.get(7)?,
+            })
+        })?;
+
+        let mut all = Vec::new();
+        let mut expected_seq = 1i64;
+        let mut expected_prev = AUDIT_GENESIS_MAC.to_string();
+        let mut valid = true;
+
+        for row in rows {
+            let entry = row?;
+            if entry.seq != expected_seq
+                || !constant_time_str_eq(&entry.prev_mac_sha512, &expected_prev)
+            {
+                valid = false;
+            }
+            let recomputed = compute_audit_chain_mac(
+                audit_key,
+                &entry.prev_mac_sha512,
+                entry.seq,
+                entry.timestamp,
+                &entry.event_type,
+                &entry.actor,
+                &entry.resource,
+                &entry.outcome,
+            );
+            if !constant_time_str_eq(&entry.entry_mac_sha512, &recomputed) {
+                valid = false;
+            }
+            expected_seq += 1;
+            expected_prev = entry.entry_mac_sha512.clone();
+            all.push(entry);
+        }
+
+        let total = all.len() as u64;
+        let cap = limit.clamp(1, 500);
+        let tail = if all.len() > cap {
+            all.split_off(all.len() - cap)
+        } else {
+            all
+        };
+        Ok((valid, total, tail))
+    }
+
+    /// Perform an online encrypted backup by checkpointing WAL frames into `vault.db`
+    /// and copying `vault.db` + `vault.envelope` into a `0700`/`0600` snapshot directory.
+    pub fn create_encrypted_backup(&self) -> Result<BackupMetadata, StorageError> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+        let now = now_unix_seconds();
+        let mut suffix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut suffix);
+        let snapshot_id = format!("snap_{}_{}", now, hex_encode(suffix));
+
+        let backups_root = self.data_dir.join("backups");
+        ensure_secure_dir(&backups_root)?;
+        let snap_dir = backups_root.join(&snapshot_id);
+        ensure_secure_dir(&snap_dir)?;
+
+        let dst_db = snap_dir.join(DB_FILENAME);
+        let dst_env = snap_dir.join(ENVELOPE_FILENAME);
+
+        let db_bytes = copy_file_0600_synced(&self.db_path, &dst_db)?;
+        let env_bytes = copy_file_0600_synced(&envelope_path(&self.data_dir), &dst_env)?;
+
+        Ok(BackupMetadata {
+            snapshot_id,
+            backup_dir: snap_dir.to_string_lossy().to_string(),
+            total_bytes: db_bytes + env_bytes,
+        })
+    }
+}
+
+fn copy_file_0600_synced(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let bytes = fs::read(src)?;
+    let mut f = fs::File::create(dst)?;
+    set_mode_0600(dst)?;
+    f.write_all(&bytes)?;
+    f.sync_all()?;
+    Ok(bytes.len() as u64)
 }

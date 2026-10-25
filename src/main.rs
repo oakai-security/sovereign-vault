@@ -1,4 +1,4 @@
-//! Sovereign Vault v0.2: Single-binary Micro-KMS Daemon and Zero-History Admin CLI.
+//! Sovereign Vault v0.2: Single-binary Micro-KMS Daemon and Zero-History Admin & Workload CLI.
 //!
 //! All sensitive CLI inputs (bootstrap nonces, unseal keys, machine tokens, and secret values)
 //! are collected exclusively via hidden `/dev/tty` prompts (`rpassword`) or `--stdin` pipes
@@ -8,8 +8,11 @@ use clap::{Parser, Subcommand};
 use rand::RngCore;
 use sovereign_vault::{
     crypto::hex_encode,
-    server::{self, AppState, EnrollTokenResponse, HealthResponse, SecretResponse},
-    storage::is_vault_initialized,
+    server::{
+        self, AppState, AuditLogResponse, EnrollTokenResponse, HealthResponse,
+        ListSecretsResponse, ListTokensResponse, SecretResponse,
+    },
+    storage::{is_vault_initialized, BackupMetadata},
     telemetry::{maybe_spawn_telemetry_worker, TelemetryConfig},
 };
 use std::io::Read;
@@ -79,13 +82,51 @@ enum Commands {
         token_stdin: bool,
     },
 
-    /// Enroll or revoke SHA-512 path-scoped machine tokens
+    /// Create an online encrypted SQLCipher snapshot backup (requires admin token)
+    Backup {
+        #[arg(long, default_value = "http://127.0.0.1:8443")]
+        url: String,
+
+        #[arg(long)]
+        token_stdin: bool,
+    },
+
+    /// Inspect and cryptographically verify the HMAC-SHA512 hash-chained audit log (requires admin token)
+    Audit {
+        #[arg(long, default_value = "http://127.0.0.1:8443")]
+        url: String,
+
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        #[arg(long)]
+        token_stdin: bool,
+    },
+
+    /// Fetch secrets in memory and inject them as environment variables into a child process (zero .env files)
+    Run {
+        #[arg(long, default_value = "http://127.0.0.1:8443")]
+        url: String,
+
+        /// Mapping in `ENV_VAR=secret/path` format (repeatable)
+        #[arg(long = "map", required = true)]
+        mappings: Vec<String>,
+
+        #[arg(long)]
+        token_stdin: bool,
+
+        /// Child command and arguments after `--`
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+
+    /// Enroll, list, or revoke SHA-512 path-scoped machine tokens
     Token {
         #[command(subcommand)]
         action: TokenCommands,
     },
 
-    /// Read, write, or delete encrypted secrets
+    /// Read, write, list, or delete encrypted secrets
     Secret {
         #[command(subcommand)]
         action: SecretCommands,
@@ -143,6 +184,15 @@ enum TokenCommands {
         output_file: Option<PathBuf>,
     },
 
+    /// List enrolled machine token metadata (admin-only; never exposes raw tokens or hashes)
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:8443")]
+        url: String,
+
+        #[arg(long)]
+        token_stdin: bool,
+    },
+
     /// Immediately revoke an enrolled machine token by ID (`tok_...`)
     Revoke {
         #[arg(long, default_value = "http://127.0.0.1:8443")]
@@ -189,6 +239,18 @@ enum SecretCommands {
         raw: bool,
     },
 
+    /// List secret paths & versions visible to the caller's token (never exposes values)
+    List {
+        #[arg(long, default_value = "http://127.0.0.1:8443")]
+        url: String,
+
+        #[arg(long)]
+        prefix: Option<String>,
+
+        #[arg(long)]
+        token_stdin: bool,
+    },
+
     /// Delete a secret path
     Delete {
         #[arg(long, default_value = "http://127.0.0.1:8443")]
@@ -213,10 +275,9 @@ fn read_secret_input(prompt: &str, from_stdin: bool) -> Result<Zeroizing<String>
         }
         Ok(trimmed)
     } else {
-        let val = Zeroizing::new(
-            rpassword::prompt_password(prompt)
-                .map_err(|e| format!("Hidden TTY prompt failed (use --stdin for non-interactive pipes): {e}"))?,
-        );
+        let val = Zeroizing::new(rpassword::prompt_password(prompt).map_err(|e| {
+            format!("Hidden TTY prompt failed (use --stdin for non-interactive pipes): {e}")
+        })?);
         let trimmed = Zeroizing::new(val.trim().to_string());
         if trimmed.is_empty() {
             return Err("Empty input aborted".to_string());
@@ -266,10 +327,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut nonce_bytes = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut nonce_bytes);
                 let n = format!("init_{}", hex_encode(nonce_bytes));
-                tracing::warn!("================================================================================");
-                tracing::warn!("VAULT UNINITIALIZED: Use this single-use ephemeral bootstrap nonce to initialize:");
+                tracing::warn!(
+                    "================================================================================"
+                );
+                tracing::warn!(
+                    "VAULT UNINITIALIZED: Use this single-use ephemeral bootstrap nonce to initialize:"
+                );
                 tracing::warn!("Nonce: {}", n);
-                tracing::warn!("================================================================================");
+                tracing::warn!(
+                    "================================================================================"
+                );
                 Some(n)
             } else {
                 tracing::info!("Encrypted SQLCipher vault detected. Starting in SEALED mode.");
@@ -358,6 +425,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&body)?);
         }
 
+        Commands::Backup { url, token_stdin } => {
+            let tok = resolve_caller_token(token_stdin)?;
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!("{}/v1/sys/backup", url.trim_end_matches('/')))
+                .header("X-Vault-Token", tok.as_str())
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err_body: serde_json::Value = resp.json().await?;
+                eprintln!("Backup failed ({status}): {}", err_body);
+                std::process::exit(1);
+            }
+            let meta: BackupMetadata = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&meta)?);
+        }
+
+        Commands::Audit {
+            url,
+            limit,
+            token_stdin,
+        } => {
+            let tok = resolve_caller_token(token_stdin)?;
+            let client = reqwest::Client::new();
+            let resp = client
+                .get(format!(
+                    "{}/v1/sys/audit?limit={}",
+                    url.trim_end_matches('/'),
+                    limit
+                ))
+                .header("X-Vault-Token", tok.as_str())
+                .send()
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let err_body: serde_json::Value = resp.json().await?;
+                eprintln!("Audit query failed ({status}): {}", err_body);
+                std::process::exit(1);
+            }
+            let report: AuditLogResponse = resp.json().await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.chain_verified {
+                eprintln!("CRITICAL: Audit HMAC-SHA512 hash chain verification FAILED!");
+                std::process::exit(2);
+            }
+        }
+
+        Commands::Run {
+            url,
+            mappings,
+            token_stdin,
+            cmd,
+        } => {
+            let tok = resolve_caller_token(token_stdin)?;
+            let client = reqwest::Client::new();
+            let base = url.trim_end_matches('/');
+
+            let mut resolved_envs: Vec<(String, Zeroizing<String>)> =
+                Vec::with_capacity(mappings.len());
+            for item in &mappings {
+                let (env_key, secret_path) = item.split_once('=').ok_or_else(|| {
+                    format!("Invalid --map '{item}': expected ENV_VAR=secret/path")
+                })?;
+                if env_key.trim().is_empty() {
+                    return Err("Environment variable name in --map cannot be empty".into());
+                }
+                let resp = client
+                    .get(format!("{base}/v1/secret/{}", secret_path.trim_start_matches('/')))
+                    .header("X-Vault-Token", tok.as_str())
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err_body: serde_json::Value = resp.json().await?;
+                    eprintln!("Failed fetching '{secret_path}' ({status}): {err_body}");
+                    std::process::exit(1);
+                }
+                let sec: SecretResponse = resp.json().await?;
+                resolved_envs.push((env_key.trim().to_string(), Zeroizing::new(sec.value)));
+            }
+            drop(tok);
+
+            let mut child_cmd = Command::new(&cmd[0]);
+            if cmd.len() > 1 {
+                child_cmd.args(&cmd[1..]);
+            }
+            // Scrub VAULT_TOKEN from child environment unless explicitly mapped
+            child_cmd.env_remove("VAULT_TOKEN");
+            for (k, v) in &resolved_envs {
+                child_cmd.env(k, v.as_str());
+            }
+
+            let mut child = child_cmd.spawn()?;
+            // Scrub parent secret buffers immediately while child executes
+            drop(resolved_envs);
+
+            let status = child.wait()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+
         Commands::Token { action } => match action {
             TokenCommands::Enroll {
                 url,
@@ -404,6 +572,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!("{}", serde_json::to_string_pretty(&enrolled)?);
                 }
+            }
+
+            TokenCommands::List { url, token_stdin } => {
+                let admin_tok = resolve_caller_token(token_stdin)?;
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get(format!("{}/v1/sys/tokens", url.trim_end_matches('/')))
+                    .header("X-Vault-Token", admin_tok.as_str())
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err_body: serde_json::Value = resp.json().await?;
+                    eprintln!("Token list failed ({status}): {}", err_body);
+                    std::process::exit(1);
+                }
+                let list: ListTokensResponse = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&list)?);
             }
 
             TokenCommands::Revoke {
@@ -493,6 +679,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            SecretCommands::List {
+                url,
+                prefix,
+                token_stdin,
+            } => {
+                let tok = resolve_caller_token(token_stdin)?;
+                let client = reqwest::Client::new();
+                let mut req = client
+                    .get(format!("{}/v1/secrets", url.trim_end_matches('/')))
+                    .header("X-Vault-Token", tok.as_str());
+                if let Some(pref) = prefix {
+                    req = req.query(&[("prefix", pref)]);
+                }
+                let resp = req.send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err_body: serde_json::Value = resp.json().await?;
+                    eprintln!("Secret list failed ({status}): {}", err_body);
+                    std::process::exit(1);
+                }
+                let list: ListSecretsResponse = resp.json().await?;
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            }
+
             SecretCommands::Delete {
                 url,
                 path,
@@ -534,7 +744,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Ok(resp) = health_res {
                     if let Ok(health) = resp.json::<HealthResponse>().await {
                         if health.initialized && health.sealed {
-                            eprintln!("Vault detected in SEALED state; retrieving key via OS Secret Service...");
+                            eprintln!(
+                                "Vault detected in SEALED state; retrieving key via OS Secret Service..."
+                            );
                             let out = Command::new("sh").arg("-c").arg(&key_cmd).output();
                             match out {
                                 Ok(o) if o.status.success() => {

@@ -1,7 +1,10 @@
 //! Hardened HTTP REST API daemon with:
 //! - Envelope DEK/KEK verification on unseal (`409` if already unsealed, `401` on bad key)
 //! - Mandatory default-deny SHA-512 constant-time machine token authentication
+//! - Sliding-window brute-force rate limiting (`429 Too Many Requests`)
 //! - Canonical path ACL enforcement with exact trailing-slash directory boundaries
+//! - Tamper-evident RFC 2104 HMAC-SHA512 hash-chained audit logging (`GET /v1/sys/audit`)
+//! - Online encrypted SQLCipher backup snapshots (`POST /v1/sys/backup`) & metadata listing
 //! - Deadlock-free `RwLock<Option<VaultActiveState>>` concurrency hierarchy
 
 use crate::acl::{
@@ -13,27 +16,33 @@ use crate::crypto::{
     parse_machine_token, unwrap_envelope, verify_token_sha512_ct, LockedKey,
 };
 use crate::storage::{
-    is_vault_initialized, now_unix_seconds, read_envelope_header, write_envelope_header, Storage,
+    is_vault_initialized, now_unix_seconds, read_envelope_header, write_envelope_header,
+    AuditLogEntry, BackupMetadata, SecretMetadataItem, Storage, TokenMetadataItem,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+const DEFAULT_MAX_AUTH_FAILURES_PER_MINUTE: usize = 15;
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
 /// Active unsealed vault state. Exists in RAM strictly while the vault is unsealed;
-/// dropping this struct closes SQLCipher and zeroizes + munlocks `value_aead_key`.
+/// dropping this struct closes SQLCipher and zeroizes + munlocks `value_aead_key` and `audit_chain_key`.
 pub struct VaultActiveState {
     pub storage: Mutex<Storage>,
     pub value_aead_key: LockedKey,
+    pub audit_chain_key: LockedKey,
     pub db_memory_locked: bool,
 }
 
@@ -41,18 +50,68 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub started_at: Instant,
     pub telemetry_enabled: bool,
+    pub max_auth_failures_per_window: usize,
+    pub auth_failures: Mutex<VecDeque<Instant>>,
     pub bootstrap_nonce: Mutex<Option<Zeroizing<String>>>,
     pub active: RwLock<Option<VaultActiveState>>,
 }
 
 impl AppState {
     pub fn new(data_dir: PathBuf, bootstrap_nonce: Option<String>, telemetry_enabled: bool) -> Self {
+        Self::with_rate_limit(
+            data_dir,
+            bootstrap_nonce,
+            telemetry_enabled,
+            DEFAULT_MAX_AUTH_FAILURES_PER_MINUTE,
+        )
+    }
+
+    pub fn with_rate_limit(
+        data_dir: PathBuf,
+        bootstrap_nonce: Option<String>,
+        telemetry_enabled: bool,
+        max_auth_failures_per_window: usize,
+    ) -> Self {
         Self {
             data_dir,
             started_at: Instant::now(),
             telemetry_enabled,
+            max_auth_failures_per_window: max_auth_failures_per_window.max(1),
+            auth_failures: Mutex::new(VecDeque::new()),
             bootstrap_nonce: Mutex::new(bootstrap_nonce.map(Zeroizing::new)),
             active: RwLock::new(None),
+        }
+    }
+
+    fn check_rate_limit(&self) -> Result<(), ApiError> {
+        let mut guard = self
+            .auth_failures
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Rate limiter lock error"))?;
+        let now = Instant::now();
+        while let Some(&front) = guard.front() {
+            if now.duration_since(front) >= RATE_LIMIT_WINDOW {
+                guard.pop_front();
+            } else {
+                break;
+            }
+        }
+        if guard.len() >= self.max_auth_failures_per_window {
+            tracing::warn!(
+                failures_in_window = guard.len(),
+                "Rate limit exceeded on authentication / unseal window"
+            );
+            return Err(api_err(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many failed authentication or unseal attempts; retry after 60 seconds",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_auth_failure(&self) {
+        if let Ok(mut guard) = self.auth_failures.lock() {
+            guard.push_back(Instant::now());
         }
     }
 }
@@ -87,6 +146,33 @@ pub struct PutSecretRequest {
     pub value: String,
 }
 
+#[derive(Deserialize, Default)]
+pub struct ListSecretsQuery {
+    pub prefix: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ListSecretsResponse {
+    pub secrets: Vec<SecretMetadataItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ListTokensResponse {
+    pub tokens: Vec<TokenMetadataItem>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AuditLogResponse {
+    pub chain_verified: bool,
+    pub total_events: u64,
+    pub events: Vec<AuditLogEntry>,
+}
+
 #[derive(Deserialize)]
 pub struct EnrollTokenRequest {
     pub project: String,
@@ -113,8 +199,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/v1/sys/init", post(init_handler))
         .route("/v1/sys/unseal", post(unseal_handler))
         .route("/v1/sys/seal", post(seal_handler))
+        .route("/v1/sys/backup", post(backup_handler))
+        .route("/v1/sys/audit", get(audit_log_handler))
         .route("/v1/sys/enroll", post(enroll_handler))
+        .route("/v1/sys/tokens", get(list_tokens_handler))
         .route("/v1/sys/tokens/:token_id", delete(revoke_token_handler))
+        .route("/v1/secrets", get(list_secrets_handler))
         .route(
             "/v1/secret/*path",
             get(get_secret_handler)
@@ -131,6 +221,24 @@ fn api_err(code: StatusCode, msg: &'static str) -> ApiError {
     (code, Json(serde_json::json!({ "error": msg })))
 }
 
+fn record_audit(
+    active: &VaultActiveState,
+    event_type: &str,
+    actor: &str,
+    resource: &str,
+    outcome: &str,
+) {
+    if let Ok(mut db) = active.storage.lock() {
+        let _ = db.append_audit_event(
+            &active.audit_chain_key,
+            event_type,
+            actor,
+            resource,
+            outcome,
+        );
+    }
+}
+
 /// Extract raw bearer token strictly from `X-Vault-Token` or `Authorization: Bearer ...`.
 /// Default-deny: missing or malformed headers ALWAYS fail with `401 Unauthorized`.
 fn extract_raw_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -140,7 +248,10 @@ fn extract_raw_token(headers: &HeaderMap) -> Result<&str, ApiError> {
             .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "Malformed X-Vault-Token header"))?
             .trim();
         if s.is_empty() {
-            return Err(api_err(StatusCode::UNAUTHORIZED, "Empty X-Vault-Token header"));
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "Empty X-Vault-Token header",
+            ));
         }
         return Ok(s);
     }
@@ -170,12 +281,29 @@ fn extract_raw_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 /// Authenticate a machine token against SQLCipher using SHA-512 constant-time verification.
 fn authenticate_caller(
+    state: &AppState,
     active: &VaultActiveState,
     headers: &HeaderMap,
 ) -> Result<ScopedToken, ApiError> {
-    let raw_tok = extract_raw_token(headers)?;
-    let (token_id, candidate_secret) = parse_machine_token(raw_tok)
-        .map_err(|_| api_err(StatusCode::UNAUTHORIZED, "Invalid machine token format"))?;
+    state.check_rate_limit()?;
+
+    let raw_tok = match extract_raw_token(headers) {
+        Ok(t) => t,
+        Err(e) => {
+            state.record_auth_failure();
+            return Err(e);
+        }
+    };
+    let (token_id, candidate_secret) = match parse_machine_token(raw_tok) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            state.record_auth_failure();
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "Invalid machine token format",
+            ));
+        }
+    };
 
     let stored_tok = {
         let db = active
@@ -188,17 +316,28 @@ fn authenticate_caller(
 
     let tok = match stored_tok {
         Some(t) => t,
-        None => return Err(api_err(StatusCode::UNAUTHORIZED, "Unknown or revoked machine token")),
+        None => {
+            state.record_auth_failure();
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "Unknown or revoked machine token",
+            ));
+        }
     };
 
     if !verify_token_sha512_ct(&candidate_secret, &tok.token_hash_sha512) {
+        state.record_auth_failure();
         return Err(api_err(StatusCode::UNAUTHORIZED, "Invalid machine token"));
     }
 
     let now = now_unix_seconds();
     if let Some(exp) = tok.expires_at {
         if now >= exp {
-            return Err(api_err(StatusCode::UNAUTHORIZED, "Machine token has expired"));
+            state.record_auth_failure();
+            return Err(api_err(
+                StatusCode::UNAUTHORIZED,
+                "Machine token has expired",
+            ));
         }
     }
 
@@ -211,7 +350,9 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     let (sealed, memory_locked) = match active_guard.as_ref() {
         Some(a) => (
             false,
-            a.db_memory_locked && a.value_aead_key.is_memory_locked(),
+            a.db_memory_locked
+                && a.value_aead_key.is_memory_locked()
+                && a.audit_chain_key.is_memory_locked(),
         ),
         None => (true, false),
     };
@@ -234,15 +375,23 @@ async fn init_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    state.check_rate_limit()?;
+
     let supplied_nonce = headers
         .get("X-Vault-Bootstrap-Nonce")
         .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| api_err(StatusCode::FORBIDDEN, "Missing bootstrap nonce"))?;
+        .ok_or_else(|| {
+            state.record_auth_failure();
+            api_err(StatusCode::FORBIDDEN, "Missing bootstrap nonce")
+        })?;
 
     // Acquire write guard first to prevent concurrent initialization races
     let mut active_guard = state.active.write().await;
     if is_vault_initialized(&state.data_dir) || active_guard.is_some() {
-        return Err(api_err(StatusCode::CONFLICT, "Vault is already initialized"));
+        return Err(api_err(
+            StatusCode::CONFLICT,
+            "Vault is already initialized",
+        ));
     }
 
     {
@@ -251,12 +400,14 @@ async fn init_handler(
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Bootstrap lock error"))?;
         let expected = nonce_guard.as_ref().ok_or_else(|| {
+            state.record_auth_failure();
             api_err(
                 StatusCode::FORBIDDEN,
                 "Bootstrap nonce already consumed or unavailable",
             )
         })?;
         if !constant_time_str_eq(supplied_nonce, expected.as_str()) {
+            state.record_auth_failure();
             tracing::warn!("Rejected /v1/sys/init with invalid bootstrap nonce");
             return Err(api_err(StatusCode::FORBIDDEN, "Invalid bootstrap nonce"));
         }
@@ -265,12 +416,16 @@ async fn init_handler(
     }
 
     let unseal_key = generate_unseal_key();
-    let (envelope_hdr, db_key, value_aead_key) = create_envelope(&unseal_key)
+    let (envelope_hdr, db_key, value_aead_key, audit_chain_key) = create_envelope(&unseal_key)
         .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Envelope generation failed"))?;
 
     let db_locked = db_key.is_memory_locked();
-    let storage = Storage::open_encrypted(&state.data_dir, &db_key)
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to initialize SQLCipher DB"))?;
+    let mut storage = Storage::open_encrypted(&state.data_dir, &db_key).map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to initialize SQLCipher DB",
+        )
+    })?;
 
     // Mint initial Root Admin token (SHA-512 hashed at rest) so subsequent enrollments require admin auth
     let (admin_token_id, raw_admin_token, admin_hash_sha512) = mint_machine_token();
@@ -291,16 +446,34 @@ async fn init_handler(
             &root_caps,
             None,
         )
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist root admin token"))?;
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist root admin token",
+            )
+        })?;
 
-    write_envelope_header(&state.data_dir, &envelope_hdr)
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist envelope header"))?;
+    let _ = storage.append_audit_event(
+        &audit_chain_key,
+        "sys.init",
+        &admin_token_id,
+        "sys/vault",
+        "initialized",
+    );
+
+    write_envelope_header(&state.data_dir, &envelope_hdr).map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to persist envelope header",
+        )
+    })?;
 
     let unseal_key_hex = Zeroizing::new(hex_encode(unseal_key.as_ref()));
 
     *active_guard = Some(VaultActiveState {
         storage: Mutex::new(storage),
         value_aead_key,
+        audit_chain_key,
         db_memory_locked: db_locked,
     });
 
@@ -322,6 +495,8 @@ async fn unseal_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UnsealRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
+    state.check_rate_limit()?;
+
     if !is_vault_initialized(&state.data_dir) {
         return Err(api_err(
             StatusCode::BAD_REQUEST,
@@ -334,11 +509,12 @@ async fn unseal_handler(
         return Err(api_err(StatusCode::CONFLICT, "Vault is already unsealed"));
     }
 
-    let decoded = Zeroizing::new(
-        hex_decode(payload.unseal_key.trim())
-            .map_err(|_| api_err(StatusCode::BAD_REQUEST, "Invalid hex-encoded unseal key"))?,
-    );
+    let decoded = Zeroizing::new(hex_decode(payload.unseal_key.trim()).map_err(|_| {
+        state.record_auth_failure();
+        api_err(StatusCode::BAD_REQUEST, "Invalid hex-encoded unseal key")
+    })?);
     if decoded.len() != 32 {
+        state.record_auth_failure();
         return Err(api_err(
             StatusCode::BAD_REQUEST,
             "Unseal key must be exactly 32 bytes (64 hex characters)",
@@ -352,13 +528,15 @@ async fn unseal_handler(
         .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read vault envelope"))?;
 
     // Cryptographically verify AEAD tag on wrapped DEK BEFORE opening DB or touching state!
-    let (db_key, value_aead_key) = unwrap_envelope(&key_arr, &header).map_err(|_| {
-        tracing::warn!("Rejected /v1/sys/unseal: AEAD verification failed for supplied key");
-        api_err(StatusCode::UNAUTHORIZED, "Invalid unseal key")
-    })?;
+    let (db_key, value_aead_key, audit_chain_key) =
+        unwrap_envelope(&key_arr, &header).map_err(|_| {
+            state.record_auth_failure();
+            tracing::warn!("Rejected /v1/sys/unseal: AEAD verification failed for supplied key");
+            api_err(StatusCode::UNAUTHORIZED, "Invalid unseal key")
+        })?;
 
     let db_locked = db_key.is_memory_locked();
-    let storage = Storage::open_encrypted(&state.data_dir, &db_key).map_err(|_| {
+    let mut storage = Storage::open_encrypted(&state.data_dir, &db_key).map_err(|_| {
         api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "SQLCipher verification failed",
@@ -370,10 +548,18 @@ async fn unseal_handler(
             "SQLCipher page authentication failed",
         )
     })?;
+    let _ = storage.append_audit_event(
+        &audit_chain_key,
+        "sys.unseal",
+        "unseal-operator",
+        "sys/vault",
+        "unsealed",
+    );
 
     *active_guard = Some(VaultActiveState {
         storage: Mutex::new(storage),
         value_aead_key,
+        audit_chain_key,
         db_memory_locked: db_locked,
     });
 
@@ -393,8 +579,15 @@ async fn seal_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is already sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/seal",
+            "forbidden",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Admin capability required to seal vault",
@@ -402,6 +595,7 @@ async fn seal_handler(
     }
 
     let caller_id = caller.token_id.clone();
+    record_audit(active, "sys.seal", &caller_id, "sys/vault", "sealed");
     *active_guard = None;
 
     tracing::warn!(token_id = %caller_id, "Vault sealed via administrative request; RAM keys zeroized and unlocked.");
@@ -409,6 +603,181 @@ async fn seal_handler(
         "status": "sealed",
         "sealed": true
     })))
+}
+
+async fn backup_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let active_guard = state.active.read().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
+
+    let caller = authenticate_caller(&state, active, &headers)?;
+    if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/backup",
+            "forbidden",
+        );
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "Admin capability required to create encrypted backups",
+        ));
+    }
+
+    let meta: BackupMetadata = {
+        let mut db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
+        let m = db
+            .create_encrypted_backup()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encrypted backup failed"))?;
+        let _ = db.append_audit_event(
+            &active.audit_chain_key,
+            "sys.backup",
+            &caller.token_id,
+            &m.snapshot_id,
+            "created",
+        );
+        m
+    };
+
+    tracing::info!(
+        admin_token_id = %caller.token_id,
+        snapshot_id = %meta.snapshot_id,
+        bytes = meta.total_bytes,
+        "Created online encrypted SQLCipher snapshot"
+    );
+
+    Ok((StatusCode::CREATED, Json(meta)))
+}
+
+async fn audit_log_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let active_guard = state.active.read().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
+
+    let caller = authenticate_caller(&state, active, &headers)?;
+    if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/audit",
+            "forbidden",
+        );
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "Admin capability required to inspect audit log",
+        ));
+    }
+
+    let limit = query.limit.unwrap_or(100);
+    let (chain_verified, total_events, events) = {
+        let db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
+        db.verify_and_list_audit_log(&active.audit_chain_key, limit)
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Audit query failed"))?
+    };
+
+    Ok(Json(AuditLogResponse {
+        chain_verified,
+        total_events,
+        events,
+    }))
+}
+
+async fn list_tokens_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let active_guard = state.active.read().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
+
+    let caller = authenticate_caller(&state, active, &headers)?;
+    if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/tokens",
+            "forbidden",
+        );
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "Admin capability required to list enrolled tokens",
+        ));
+    }
+
+    let tokens = {
+        let db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
+        db.list_tokens_metadata()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Token list query failed"))?
+    };
+
+    Ok(Json(ListTokensResponse { tokens }))
+}
+
+async fn list_secrets_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<ListSecretsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let active_guard = state.active.read().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
+
+    let caller = authenticate_caller(&state, active, &headers)?;
+    let now = now_unix_seconds();
+
+    let all_items = {
+        let db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
+        db.list_secrets_metadata()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret list query failed"))?
+    };
+
+    let prefix_filter = query
+        .prefix
+        .as_deref()
+        .map(|p| p.trim_start_matches('/'))
+        .filter(|p| !p.is_empty());
+
+    let is_admin = caller.is_admin(now);
+    let visible: Vec<SecretMetadataItem> = all_items
+        .into_iter()
+        .filter(|item| {
+            if let Some(pref) = prefix_filter {
+                if !item.path.starts_with(pref) {
+                    return false;
+                }
+            }
+            caller.is_path_allowed(&item.path, "read", now)
+                && (is_admin || caller.project == item.project)
+        })
+        .collect();
+
+    Ok(Json(ListSecretsResponse { secrets: visible }))
 }
 
 async fn enroll_handler(
@@ -421,9 +790,16 @@ async fn enroll_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     let now = now_unix_seconds();
     if !caller.is_admin(now) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/enroll",
+            "forbidden",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Admin capability required to enroll machine tokens",
@@ -460,7 +836,7 @@ async fn enroll_handler(
     let (token_id, raw_token, token_hash_sha512) = mint_machine_token();
 
     {
-        let db = active
+        let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
@@ -474,6 +850,13 @@ async fn enroll_handler(
             expires_at,
         )
         .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist token"))?;
+        let _ = db.append_audit_event(
+            &active.audit_chain_key,
+            "token.enroll",
+            &caller.token_id,
+            &token_id,
+            "created",
+        );
     }
 
     tracing::info!(
@@ -508,8 +891,15 @@ async fn revoke_token_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &target_token_id,
+            "forbidden",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Admin capability required to revoke tokens",
@@ -517,12 +907,23 @@ async fn revoke_token_handler(
     }
 
     let existed = {
-        let db = active
+        let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.delete_token(&target_token_id)
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Token deletion failed"))?
+        let ok = db
+            .delete_token(&target_token_id)
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Token deletion failed"))?;
+        if ok {
+            let _ = db.append_audit_event(
+                &active.audit_chain_key,
+                "token.revoke",
+                &caller.token_id,
+                &target_token_id,
+                "revoked",
+            );
+        }
+        ok
     };
 
     if !existed {
@@ -551,9 +952,16 @@ async fn get_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     let now = now_unix_seconds();
     if !caller.is_path_allowed(&canon_path, "read", now) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &canon_path,
+            "forbidden",
+        );
         tracing::warn!(
             token_id = %caller.token_id,
             path = %canon_path,
@@ -581,6 +989,13 @@ async fn get_secret_handler(
 
     // Non-admin tokens must also match the secret's owning project
     if !caller.is_admin(now) && caller.project != rec.project {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &canon_path,
+            "project_mismatch",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Access forbidden: project mismatch",
@@ -601,6 +1016,7 @@ async fn get_secret_handler(
         .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Corrupt UTF-8 secret"))?
         .to_string();
 
+    record_audit(active, "secret.get", &caller.token_id, &canon_path, "ok");
     tracing::info!(token_id = %caller.token_id, path = %canon_path, version = rec.version, "Secret read");
 
     Ok(Json(SecretResponse {
@@ -629,9 +1045,16 @@ async fn put_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     let now = now_unix_seconds();
     if !caller.is_path_allowed(&canon_path, "write", now) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &canon_path,
+            "forbidden",
+        );
         tracing::warn!(
             token_id = %caller.token_id,
             path = %canon_path,
@@ -644,6 +1067,13 @@ async fn put_secret_handler(
     }
 
     if !caller.is_admin(now) && caller.project != project {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &canon_path,
+            "project_mismatch",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Access forbidden: cannot write secrets under a different project",
@@ -664,6 +1094,13 @@ async fn put_secret_handler(
                 .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encryption failed"))?;
         db.put_secret_versioned(&canon_path, project, next_ver, &ct, &nonce)
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Persistence failed"))?;
+        let _ = db.append_audit_event(
+            &active.audit_chain_key,
+            "secret.put",
+            &caller.token_id,
+            &canon_path,
+            &format!("v{next_ver}"),
+        );
         next_ver
     };
 
@@ -695,8 +1132,15 @@ async fn delete_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers)?;
     if !caller.is_path_allowed(&canon_path, "delete", now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            &canon_path,
+            "forbidden",
+        );
         return Err(api_err(
             StatusCode::FORBIDDEN,
             "Access forbidden: delete outside permitted token scope",
@@ -704,12 +1148,23 @@ async fn delete_secret_handler(
     }
 
     let deleted = {
-        let db = active
+        let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.delete_secret(&canon_path)
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret deletion failed"))?
+        let ok = db
+            .delete_secret(&canon_path)
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret deletion failed"))?;
+        if ok {
+            let _ = db.append_audit_event(
+                &active.audit_chain_key,
+                "secret.delete",
+                &caller.token_id,
+                &canon_path,
+                "deleted",
+            );
+        }
+        ok
     };
 
     if !deleted {

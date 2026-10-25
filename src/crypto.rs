@@ -17,6 +17,7 @@ const ENVELOPE_AAD: &[u8] = b"sovereign-vault:v2:envelope";
 const KEK_INFO: &[u8] = b"sovereign-vault:v2:kek";
 const SQLCIPHER_KEY_INFO: &[u8] = b"sovereign-vault:v2:sqlcipher-db-key";
 const VALUE_AEAD_KEY_INFO: &[u8] = b"sovereign-vault:v2:value-aead-key";
+const AUDIT_CHAIN_KEY_INFO: &[u8] = b"sovereign-vault:v2:audit-chain-key";
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -167,10 +168,10 @@ pub fn generate_unseal_key() -> Zeroizing<[u8; 32]> {
 }
 
 /// Create a new wrapped DEK envelope from a 256-bit unseal key, returning:
-/// `(EnvelopeHeader, sqlcipher_db_key, value_aead_key)`.
+/// `(EnvelopeHeader, sqlcipher_db_key, value_aead_key, audit_chain_key)`.
 pub fn create_envelope(
     unseal_key: &[u8; 32],
-) -> Result<(EnvelopeHeader, LockedKey, LockedKey), CryptoError> {
+) -> Result<(EnvelopeHeader, LockedKey, LockedKey, LockedKey), CryptoError> {
     let mut kdf_salt = [0u8; 32];
     let mut master_dek = Zeroizing::new([0u8; 32]);
     let mut dek_nonce = [0u8; 12];
@@ -194,7 +195,7 @@ pub fn create_envelope(
         )
         .map_err(|_| CryptoError::AeadFailure)?;
 
-    let (db_key, aead_key) = derive_subkeys(&master_dek)?;
+    let (db_key, aead_key, audit_key) = derive_subkeys(&master_dek)?;
 
     let header = EnvelopeHeader {
         version: 2,
@@ -204,7 +205,7 @@ pub fn create_envelope(
         wrapped_dek_hex: hex_encode(wrapped_dek),
     };
 
-    Ok((header, db_key, aead_key))
+    Ok((header, db_key, aead_key, audit_key))
 }
 
 /// Verify and unwrap an existing `EnvelopeHeader` using the supplied unseal key.
@@ -212,7 +213,7 @@ pub fn create_envelope(
 pub fn unwrap_envelope(
     unseal_key: &[u8; 32],
     header: &EnvelopeHeader,
-) -> Result<(LockedKey, LockedKey), CryptoError> {
+) -> Result<(LockedKey, LockedKey, LockedKey), CryptoError> {
     if header.version != 2 || header.kdf != "hkdf-sha512" {
         return Err(CryptoError::CorruptEnvelope);
     }
@@ -253,18 +254,63 @@ pub fn unwrap_envelope(
     derive_subkeys(&dek_arr)
 }
 
-fn derive_subkeys(master_dek: &[u8; 32]) -> Result<(LockedKey, LockedKey), CryptoError> {
+fn derive_subkeys(master_dek: &[u8; 32]) -> Result<(LockedKey, LockedKey, LockedKey), CryptoError> {
     let hk = Hkdf::<Sha512>::new(None, master_dek);
     let mut db_raw = [0u8; 32];
     let mut aead_raw = [0u8; 32];
+    let mut audit_raw = [0u8; 32];
     hk.expand(SQLCIPHER_KEY_INFO, &mut db_raw)
         .map_err(|_| CryptoError::AeadFailure)?;
     hk.expand(VALUE_AEAD_KEY_INFO, &mut aead_raw)
         .map_err(|_| CryptoError::AeadFailure)?;
+    hk.expand(AUDIT_CHAIN_KEY_INFO, &mut audit_raw)
+        .map_err(|_| CryptoError::AeadFailure)?;
 
     let db_key = LockedKey::new(db_raw)?;
     let aead_key = LockedKey::new(aead_raw)?;
-    Ok((db_key, aead_key))
+    let audit_key = LockedKey::new(audit_raw)?;
+    Ok((db_key, aead_key, audit_key))
+}
+
+/// Compute an RFC 2104 HMAC-SHA512 digest over length-prefixed tamper-evident audit fields.
+pub fn compute_audit_chain_mac(
+    audit_key: &LockedKey,
+    prev_mac_hex: &str,
+    seq: i64,
+    timestamp: i64,
+    event_type: &str,
+    actor: &str,
+    resource: &str,
+    outcome: &str,
+) -> String {
+    let mut ipad = Zeroizing::new([0x36u8; 128]);
+    let mut opad = Zeroizing::new([0x5cu8; 128]);
+    for (i, &b) in audit_key.as_bytes().iter().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+
+    let mut inner = Sha512::new();
+    inner.update(ipad.as_slice());
+    inner.update(b"sv:v2:audit:");
+    for field in [
+        prev_mac_hex.as_bytes(),
+        &seq.to_be_bytes(),
+        &timestamp.to_be_bytes(),
+        event_type.as_bytes(),
+        actor.as_bytes(),
+        resource.as_bytes(),
+        outcome.as_bytes(),
+    ] {
+        inner.update((field.len() as u64).to_be_bytes());
+        inner.update(field);
+    }
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha512::new();
+    outer.update(opad.as_slice());
+    outer.update(inner_digest);
+    hex_encode(outer.finalize())
 }
 
 /// Construct canonical Associated Data (AAD) binding a secret ciphertext to its exact path, project, and version.

@@ -500,3 +500,245 @@ async fn test_telemetry_air_gapped_by_default_and_privacy_preserving() {
     assert!(!serialized.contains("sap_password"));
     assert!(!serialized.contains("ultra_confidential_sap_pw"));
 }
+
+#[tokio::test]
+async fn test_tamper_evident_audit_chain_and_acl_filtered_listing() {
+    let (_dir, _state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // Seed two secrets under different projects/prefixes
+    let (s1, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/apps/alpha/db_url",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "alpha", "value": "postgres://alpha" })),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    let (s2, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/apps/beta/db_url",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "beta", "value": "postgres://beta" })),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // Enroll a worker scoped strictly to `apps/alpha/*`
+    let (en_st, en_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/enroll",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "alpha",
+            "name": "alpha-reader",
+            "allowed_paths": ["apps/alpha/*"],
+            "capabilities": ["read"]
+        })),
+    )
+    .await;
+    assert_eq!(en_st, StatusCode::CREATED);
+    let alpha_token = en_body["token"].as_str().unwrap().to_string();
+
+    // Scoped worker lists secrets -> sees ONLY `apps/alpha/db_url`, NEVER `apps/beta/db_url` or values
+    let (list_st, list_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("X-Vault-Token", &alpha_token)],
+        None,
+    )
+    .await;
+    assert_eq!(list_st, StatusCode::OK);
+    let visible = list_body["secrets"].as_array().expect("secrets array");
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0]["path"], "apps/alpha/db_url");
+    assert!(visible[0].get("value").is_none());
+
+    // Scoped worker attempts denied read on `apps/beta/db_url` -> recorded in tamper-evident audit log
+    let (den_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/apps/beta/db_url",
+        &[("X-Vault-Token", &alpha_token)],
+        None,
+    )
+    .await;
+    assert_eq!(den_st, StatusCode::FORBIDDEN);
+
+    // Scoped worker cannot read `/v1/sys/audit` or `/v1/sys/tokens`
+    let (aud_forb, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit",
+        &[("X-Vault-Token", &alpha_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud_forb, StatusCode::FORBIDDEN);
+
+    // Admin queries `/v1/sys/tokens` (no hashes exposed) and `/v1/sys/audit` (HMAC-SHA512 chain verified)
+    let (tok_st, tok_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/tokens",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(tok_st, StatusCode::OK);
+    assert_eq!(tok_body["tokens"].as_array().unwrap().len(), 2);
+    assert!(!tok_body.to_string().contains("token_hash"));
+
+    let (aud_st, aud_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit?limit=50",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud_st, StatusCode::OK);
+    assert_eq!(aud_body["chain_verified"], true);
+    assert!(aud_body["total_events"].as_u64().unwrap() >= 5);
+}
+
+#[tokio::test]
+async fn test_online_encrypted_backup_and_restore() {
+    let (_dir, _state, app, unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    let (st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/dr/vault/recovery_seed",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "dr", "value": "seed-intact-after-online-backup" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (bk_st, bk_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/backup",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(bk_st, StatusCode::CREATED);
+    let backup_dir = std::path::PathBuf::from(bk_body["backup_dir"].as_str().unwrap());
+    assert!(backup_dir.join("vault.db").is_file());
+    assert!(backup_dir.join("vault.envelope").is_file());
+
+    // Restore snapshot into a brand-new directory and unseal a fresh daemon instance
+    let restore_dir = TempDir::new().expect("restore tempdir");
+    std::fs::copy(
+        backup_dir.join("vault.db"),
+        restore_dir.path().join("vault.db"),
+    )
+    .unwrap();
+    std::fs::copy(
+        backup_dir.join("vault.envelope"),
+        restore_dir.path().join("vault.envelope"),
+    )
+    .unwrap();
+
+    let restored_state = Arc::new(AppState::new(restore_dir.path().to_path_buf(), None, false));
+    let restored_app = create_router(restored_state);
+
+    let (un_st, _) = send_json(
+        &restored_app,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": unseal_key })),
+    )
+    .await;
+    assert_eq!(un_st, StatusCode::OK);
+
+    let (get_st, get_body) = send_json(
+        &restored_app,
+        Method::GET,
+        "/v1/secret/dr/vault/recovery_seed",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(get_st, StatusCode::OK);
+    assert_eq!(get_body["value"], "seed-intact-after-online-backup");
+}
+
+#[tokio::test]
+async fn test_rate_limiting_blocks_repeated_auth_or_unseal_failures() {
+    let dir = TempDir::new().expect("tempdir");
+    let nonce = "init_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let state = Arc::new(AppState::with_rate_limit(
+        dir.path().to_path_buf(),
+        Some(nonce.to_string()),
+        false,
+        3,
+    ));
+    let app = create_router(state);
+
+    for _ in 0..3 {
+        let (st, _) = send_json(
+            &app,
+            Method::POST,
+            "/v1/sys/init",
+            &[("X-Vault-Bootstrap-Nonce", "init_bad")],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    // 4th attempt within the 60s window MUST be throttled with 429 Too Many Requests
+    let (throttled_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/init",
+        &[("X-Vault-Bootstrap-Nonce", nonce)],
+        None,
+    )
+    .await;
+    assert_eq!(throttled_st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_concurrent_health_and_secret_read_write_stress() {
+    let (_dir, _state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    let mut handles = Vec::new();
+    for i in 0..24usize {
+        let router = app.clone();
+        let tok = admin_token.clone();
+        handles.push(tokio::spawn(async move {
+            let path = format!("/v1/secret/stress/worker/{i}");
+            let (p_st, _) = send_json(
+                &router,
+                Method::PUT,
+                &path,
+                &[("X-Vault-Token", &tok)],
+                Some(json!({ "project": "stress", "value": format!("val-{i}") })),
+            )
+            .await;
+            assert_eq!(p_st, StatusCode::OK);
+
+            let (h_st, h_body) = send_json(&router, Method::GET, "/v1/sys/health", &[], None).await;
+            assert_eq!(h_st, StatusCode::OK);
+            assert_eq!(h_body["sealed"], false);
+
+            let (g_st, g_body) =
+                send_json(&router, Method::GET, &path, &[("X-Vault-Token", &tok)], None).await;
+            assert_eq!(g_st, StatusCode::OK);
+            assert_eq!(g_body["value"], format!("val-{i}"));
+        }));
+    }
+
+    for h in handles {
+        h.await.expect("concurrent worker panicked or deadlocked");
+    }
+}

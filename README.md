@@ -84,7 +84,30 @@ python3 python3 -m keyring \
     --token-stdin
 ```
 
-### 4. Seal & Auto-Unseal Verification
+### 4. Zero-File Secret Injection (`sovereign-vault run`)
+Inject secrets directly into a child process in memory without ever writing a `.env` file to disk:
+```bash
+python3 python3 -m keyring \
+  get sovereign-vault admin-token | \
+  docker exec -i sovereign-vault sovereign-vault run \
+    --map DB_PASSWORD=apps/jellyfin/db_pass \
+    --token-stdin -- env
+```
+
+### 5. Online Encrypted Backup & Tamper-Evident Audit Verification
+```bash
+# Create an atomic 0600 SQLCipher snapshot in /data/backups/
+python3 python3 -m keyring \
+  get sovereign-vault admin-token | \
+  docker exec -i sovereign-vault sovereign-vault backup --token-stdin
+
+# Verify full RFC 2104 HMAC-SHA512 hash-chained audit history
+python3 python3 -m keyring \
+  get sovereign-vault admin-token | \
+  docker exec -i sovereign-vault sovereign-vault audit --limit 50 --token-stdin
+```
+
+### 6. Seal & Auto-Unseal Verification
 ```bash
 # Seal vault (drops SQLCipher connection & scrubs mlock'd RAM pages)
 python3 python3 -m keyring \
