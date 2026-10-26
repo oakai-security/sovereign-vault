@@ -54,6 +54,42 @@ pub fn validate_scope_pattern(pattern: &str) -> Result<String, &'static str> {
     canonicalize_secret_path(pattern)
 }
 
+/// Validate an identifier (`project` or token `name`): must be 1..=64 ASCII characters
+/// drawn strictly from `[a-zA-Z0-9._-]` (prevents `:` delimiter collisions in AAD).
+pub fn validate_identifier(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return Err("Identifier (project/name) must be 1..=64 characters");
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err("Identifier (project/name) may only contain [a-zA-Z0-9._-]");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Canonicalize a `prefix` query filter for `GET /v1/secrets?prefix=...` and enforce
+/// directory-boundary matching (`apps/jellyfin` matches `apps/jellyfin` or `apps/jellyfin/...`,
+/// never sibling `apps/jellyfin-prod/...`).
+pub fn canonicalize_prefix_filter(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("Prefix filter must not be empty");
+    }
+    canonicalize_secret_path(trimmed)
+}
+
+/// Check if `canonical_path` matches a canonical directory `prefix` along exact `/` boundaries.
+pub fn path_matches_directory_prefix(canonical_path: &str, canonical_prefix: &str) -> bool {
+    if canonical_path == canonical_prefix {
+        return true;
+    }
+    canonical_path.starts_with(canonical_prefix)
+        && canonical_path.as_bytes().get(canonical_prefix.len()) == Some(&b'/')
+}
+
 /// Validate capability names (`read`, `write`, `delete`, `admin`).
 pub fn validate_capabilities(caps: &[String]) -> Result<(), &'static str> {
     if caps.is_empty() {

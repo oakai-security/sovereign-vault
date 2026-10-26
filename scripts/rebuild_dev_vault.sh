@@ -38,10 +38,10 @@ echo "[3/4] Building hardened Sovereign Vault v0.2 image & starting on 127.0.0.1
 cd "$REPO_DIR"
 docker compose up -d --build
 
-echo "[4/4] Waiting for daemon health check on http://127.0.0.1:8443/v1/sys/health..."
+echo "[4/4] Waiting for daemon health check on https://127.0.0.1:8443/v1/sys/health..."
 READY="false"
 for _ in $(seq 1 30); do
-    if curl -fsS --max-time 2 http://127.0.0.1:8443/v1/sys/health >/dev/null 2>&1; then
+    if curl -k -fsS --max-time 2 https://127.0.0.1:8443/v1/sys/health >/dev/null 2>&1; then
         READY="true"
         break
     fi
@@ -55,7 +55,7 @@ fi
 
 echo ""
 echo "Health status:"
-curl -fsS --max-time 3 http://127.0.0.1:8443/v1/sys/health && echo ""
+curl -k -fsS --max-time 3 https://127.0.0.1:8443/v1/sys/health && echo ""
 
 if [[ "$AUTO_INIT" == "true" ]]; then
     echo ""
@@ -66,7 +66,7 @@ if [[ "$AUTO_INIT" == "true" ]]; then
         exit 1
     fi
 
-    INIT_JSON="$(printf '%s' "$NONCE" | docker exec -i sovereign-vault sovereign-vault init --url http://127.0.0.1:8443 --nonce-stdin)"
+    INIT_JSON="$(printf '%s' "$NONCE" | docker exec -i sovereign-vault sovereign-vault -k init --nonce-stdin)"
     unset NONCE
 
     if [[ -f "$SECRET_PY" ]]; then
@@ -76,6 +76,13 @@ data = json.loads(sys.stdin.read())
 keyring.set_password("sovereign-vault", "unseal-key", data["unseal_key"])
 keyring.set_password("sovereign-vault", "admin-token", data["admin_token"])
 print("[auto-init] Stored unseal-key and admin-token (" + data["admin_token_id"] + ") in Ubuntu Secret Service (keyring).")
+key = data["unseal_key"]
+import requests
+r = requests.post("http://127.0.0.1:8443/v1/sys/unseal", json={"unseal_key": key}, timeout=5)
+if r.status_code == 200:
+    print("[auto-init] Vault successfully unsealed and active!")
+else:
+    print(f"[auto-init] WARNING: Unseal returned status {r.status_code}: {r.text}")
 ' <<<"$INIT_JSON"
     else
         echo "[auto-init] WARNING: secret_service.py not found; printing bootstrap output once:"

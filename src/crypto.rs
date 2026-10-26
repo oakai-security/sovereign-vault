@@ -62,8 +62,14 @@ unsafe impl Send for LockedKey {}
 unsafe impl Sync for LockedKey {}
 
 impl LockedKey {
-    /// Move 32 key bytes into a dedicated RAM-locked page and zeroize the caller's stack copy.
+    /// Move 32 key bytes into a dedicated RAM-locked page and zeroize the caller's buffer in place.
     pub fn new(mut raw_bytes: [u8; 32]) -> Result<Self, CryptoError> {
+        Self::from_mut_array(&mut raw_bytes)
+    }
+
+    /// Move 32 key bytes from a mutable reference into a dedicated RAM-locked page,
+    /// scrubbing the caller's stack/heap buffer in place without unzeroized by-value stack copies.
+    pub fn from_mut_array(raw_bytes: &mut [u8; 32]) -> Result<Self, CryptoError> {
         #[cfg(unix)]
         unsafe {
             let page_size = {
@@ -111,7 +117,7 @@ impl LockedKey {
         #[cfg(not(unix))]
         {
             let mut boxed = Box::new([0u8; 32]);
-            boxed.copy_from_slice(&raw_bytes);
+            boxed.copy_from_slice(raw_bytes);
             raw_bytes.zeroize();
             Ok(Self { fallback: boxed })
         }
@@ -254,21 +260,35 @@ pub fn unwrap_envelope(
     derive_subkeys(&dek_arr)
 }
 
+/// Lock all current and future process virtual memory pages (`mlockall(MCL_CURRENT | MCL_FUTURE)`)
+/// when container `ulimits.memlock` permits, ensuring SQLCipher's internal C heap key schedule
+/// and SQLite page caches are also pinned in RAM and never paged to swap.
+pub fn lock_process_memory() -> bool {
+    #[cfg(unix)]
+    unsafe {
+        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 fn derive_subkeys(master_dek: &[u8; 32]) -> Result<(LockedKey, LockedKey, LockedKey), CryptoError> {
     let hk = Hkdf::<Sha512>::new(None, master_dek);
-    let mut db_raw = [0u8; 32];
-    let mut aead_raw = [0u8; 32];
-    let mut audit_raw = [0u8; 32];
-    hk.expand(SQLCIPHER_KEY_INFO, &mut db_raw)
+    let mut db_raw = Zeroizing::new([0u8; 32]);
+    let mut aead_raw = Zeroizing::new([0u8; 32]);
+    let mut audit_raw = Zeroizing::new([0u8; 32]);
+    hk.expand(SQLCIPHER_KEY_INFO, db_raw.as_mut())
         .map_err(|_| CryptoError::AeadFailure)?;
-    hk.expand(VALUE_AEAD_KEY_INFO, &mut aead_raw)
+    hk.expand(VALUE_AEAD_KEY_INFO, aead_raw.as_mut())
         .map_err(|_| CryptoError::AeadFailure)?;
-    hk.expand(AUDIT_CHAIN_KEY_INFO, &mut audit_raw)
+    hk.expand(AUDIT_CHAIN_KEY_INFO, audit_raw.as_mut())
         .map_err(|_| CryptoError::AeadFailure)?;
 
-    let db_key = LockedKey::new(db_raw)?;
-    let aead_key = LockedKey::new(aead_raw)?;
-    let audit_key = LockedKey::new(audit_raw)?;
+    let db_key = LockedKey::from_mut_array(&mut db_raw)?;
+    let aead_key = LockedKey::from_mut_array(&mut aead_raw)?;
+    let audit_key = LockedKey::from_mut_array(&mut audit_raw)?;
     Ok((db_key, aead_key, audit_key))
 }
 
@@ -437,3 +457,84 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
         .collect()
 }
+
+/// Generate a self-signed X.509 certificate and private key using rcgen.
+/// Returns `(cert_pem, key_pem, fingerprint_sha256)`.
+pub fn generate_self_signed_tls_cert(
+    san_list: &[String],
+) -> Result<(String, String, String), String> {
+    let subject_alt_names: Vec<String> = if san_list.is_empty() {
+        vec!["localhost".to_string(), "127.0.0.1".to_string()]
+    } else {
+        san_list.to_vec()
+    };
+
+    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+        .map_err(|e| format!("Failed to generate self-signed certificate: {e}"))?;
+
+    let cert_pem = certified_key.cert.pem();
+    let key_pem = certified_key.signing_key.serialize_pem();
+    let cert_der = certified_key.cert.der();
+
+    use sha2::Sha256;
+    let digest = Sha256::digest(cert_der);
+    let fingerprint_hex = digest
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<String>>()
+        .join(":");
+
+    Ok((cert_pem, key_pem, fingerprint_hex))
+}
+
+/// Compute the SHA-256 fingerprint in colon-separated uppercase hex (`AA:BB:CC:...`)
+/// from a PEM-encoded X.509 certificate string.
+pub fn compute_pem_fingerprint(pem_str: &str) -> Option<String> {
+    use base64::Engine;
+    let mut b64 = String::new();
+    let mut in_cert = false;
+
+    for line in pem_str.lines() {
+        let trimmed = line.trim();
+        if trimmed == "-----BEGIN CERTIFICATE-----" {
+            in_cert = true;
+            b64.clear();
+        } else if trimmed == "-----END CERTIFICATE-----" {
+            in_cert = false;
+            if let Ok(der_bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(&der_bytes);
+                return Some(
+                    digest
+                        .iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<String>>()
+                        .join(":"),
+                );
+            }
+        } else if in_cert {
+            b64.push_str(trimmed);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_self_signed_cert() {
+        let (cert_pem, key_pem, fingerprint) =
+            generate_self_signed_tls_cert(&["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("cert generation failed");
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(fingerprint.split(':').count(), 32);
+
+        // Verify compute_pem_fingerprint recovers the exact same SHA-256 fingerprint
+        let parsed_fp = compute_pem_fingerprint(&cert_pem).expect("failed parsing PEM cert");
+        assert_eq!(parsed_fp, fingerprint);
+    }
+}
+

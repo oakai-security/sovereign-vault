@@ -742,3 +742,400 @@ async fn test_concurrent_health_and_secret_read_write_stress() {
         h.await.expect("concurrent worker panicked or deadlocked");
     }
 }
+
+#[tokio::test]
+async fn test_cross_project_isolation_version_shredding_and_rate_limit_no_self_dos() {
+    let (_dir, state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. Seed a secret owned by project "prod" at `shared/db/password` (v1 and v2)
+    let (p1_st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/shared/db/password",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "prod", "value": "prod-secret-v1" })),
+    )
+    .await;
+    assert_eq!(p1_st, StatusCode::OK);
+
+    let (p2_st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/shared/db/password",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "prod", "value": "prod-secret-v2" })),
+    )
+    .await;
+    assert_eq!(p2_st, StatusCode::OK);
+
+    // Historical version v1 can be retrieved via `?version=1`
+    let (v1_st, v1_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/shared/db/password?version=1",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(v1_st, StatusCode::OK);
+    assert_eq!(v1_body["version"], 1);
+    assert_eq!(v1_body["value"], "prod-secret-v1");
+
+    // 2. Enroll a non-admin token in project "staging" with broad `shared/*` read/write/delete scope
+    let (en_st, en_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/enroll",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "staging",
+            "name": "staging-broad-worker",
+            "allowed_paths": ["shared/*"],
+            "capabilities": ["read", "write", "delete"]
+        })),
+    )
+    .await;
+    assert_eq!(en_st, StatusCode::CREATED);
+    let staging_token = en_body["token"].as_str().unwrap().to_string();
+
+    // FM-02: "staging" token MUST NOT be able to overwrite/hijack "prod"'s secret at `shared/db/password`
+    let (clobber_st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/shared/db/password",
+        &[("X-Vault-Token", &staging_token)],
+        Some(json!({ "project": "staging", "value": "hijacked-by-staging" })),
+    )
+    .await;
+    assert_eq!(clobber_st, StatusCode::FORBIDDEN);
+
+    // FM-01: "staging" token MUST NOT be able to delete "prod"'s secret at `shared/db/password`
+    let (del_forb_st, _) = send_json(
+        &app,
+        Method::DELETE,
+        "/v1/secret/shared/db/password",
+        &[("X-Vault-Token", &staging_token)],
+        None,
+    )
+    .await;
+    assert_eq!(del_forb_st, StatusCode::FORBIDDEN);
+
+    // 3. FM-05: Admin deletes `shared/db/password` -> both `secrets` and `secret_versions` are shredded
+    let (del_ok_st, _) = send_json(
+        &app,
+        Method::DELETE,
+        "/v1/secret/shared/db/password",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(del_ok_st, StatusCode::NO_CONTENT);
+
+    {
+        let active_guard = state.active.read().await;
+        let active = active_guard.as_ref().expect("vault active");
+        let db = active.storage.lock().expect("lock db");
+        let remaining_versions = db
+            .count_secret_versions("shared/db/password")
+            .expect("count versions");
+        assert_eq!(
+            remaining_versions, 0,
+            "DELETE must purge all historical rows in secret_versions"
+        );
+    }
+
+    // 4. FM-13: Exhaust token_auth_failures with 15 bad token attempts; valid tokens must STILL work!
+    for _ in 0..15 {
+        let (bad_st, _) = send_json(
+            &app,
+            Method::GET,
+            "/v1/secrets",
+            &[("X-Vault-Token", "sv_live_00000000000000000000000000000000_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")],
+            None,
+        )
+        .await;
+        assert_eq!(bad_st, StatusCode::UNAUTHORIZED);
+    }
+
+    // 16th bad token attempt is rate-limited with 429 Too Many Requests
+    let (bad_429, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("X-Vault-Token", "sv_live_00000000000000000000000000000000_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")],
+        None,
+    )
+    .await;
+    assert_eq!(bad_429, StatusCode::TOO_MANY_REQUESTS);
+
+    // Valid admin_token is NEVER self-DoS'd by noisy unauthenticated token failures!
+    let (valid_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(valid_st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_v0_3_dual_mode_oidc_jwt_auth_presets_refresh_and_metrics() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    let (_dir, _state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. Seed secrets under `apps/jellyfin/api_key` and `apps/other/secret`
+    let (s1, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/apps/jellyfin/api_key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "jellyfin", "value": "jf-oidc-zero-secret-999" })),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+
+    let (s2, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/apps/other/secret",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "other", "value": "forbidden-to-jellyfin-jwt" })),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // 2. Generate an Ed25519 (EdDSA) keypair representing a homelab/cloud OIDC identity provider
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate ed25519 pkcs8");
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).expect("parse ed25519 keypair");
+    let pub_x = URL_SAFE_NO_PAD.encode(key_pair.public_key().as_ref());
+
+    let inline_jwks = json!({
+        "keys": [
+            {
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": "dex-ed25519-01",
+                "x": pub_x
+            }
+        ]
+    })
+    .to_string();
+
+    // 3. Enroll OIDC binding using the `dex` preset with inline JWKS -> auto-refreshes JWKS cache immediately
+    let (enroll_st, enroll_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "preset": "dex",
+            "project": "jellyfin",
+            "name": "baseline-jellyfin-oidc",
+            "issuer": "https://dex.homelab.local",
+            "audience": "sovereign-vault",
+            "subject_pattern": "system:node:baseline:*",
+            "allowed_paths": ["apps/jellyfin/*"],
+            "capabilities": ["read"],
+            "inline_jwks_json": inline_jwks
+        })),
+    )
+    .await;
+    assert_eq!(enroll_st, StatusCode::CREATED);
+    assert_eq!(enroll_body["total_cached_keys"], 1);
+    let binding_id = enroll_body["binding"]["binding_id"]
+        .as_str()
+        .expect("binding_id")
+        .to_string();
+
+    // 4. Sign a valid EdDSA OIDC JWT matching issuer, audience, and subject_pattern
+    let now = sovereign_vault::storage::now_unix_seconds();
+    let header_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "alg": "EdDSA",
+            "typ": "JWT",
+            "kid": "dex-ed25519-01"
+        }))
+        .unwrap(),
+    );
+    let claims_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iss": "https://dex.homelab.local",
+            "sub": "system:node:baseline:jellyfin",
+            "aud": ["sovereign-vault"],
+            "iat": now - 10,
+            "exp": now + 600
+        }))
+        .unwrap(),
+    );
+    let signing_input = format!("{header_b64}.{claims_b64}");
+    let sig = key_pair.sign(signing_input.as_bytes());
+    let valid_jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
+
+    // 5. Dual-Mode Auth: Present the 3-part OIDC JWT via `Authorization: Bearer <jwt>` to read `apps/jellyfin/api_key`
+    let bearer_jwt = format!("Bearer {valid_jwt}");
+    let (jwt_get_st, jwt_get_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/apps/jellyfin/api_key",
+        &[("Authorization", &bearer_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(jwt_get_st, StatusCode::OK);
+    assert_eq!(jwt_get_body["value"], "jf-oidc-zero-secret-999");
+
+    // 6. Dual-Mode Auth: Verify path ACL enforcement on OIDC JWT (`apps/other/secret` -> 403 Forbidden)
+    let (jwt_forb_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/apps/other/secret",
+        &[("Authorization", &bearer_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(jwt_forb_st, StatusCode::FORBIDDEN);
+
+    // 7. Ad-hoc JWKS cache refresh endpoint (`POST /v1/sys/oidc/refresh`) succeeds and reports cached keys
+    let (ref_st, ref_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/refresh",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(ref_st, StatusCode::OK);
+    assert_eq!(ref_body["refreshed_issuers"].as_array().unwrap().len(), 1);
+    assert_eq!(ref_body["total_cached_keys"], 1);
+
+    // 8. Fleet Metrics endpoint (`GET /v1/sys/metrics` JSON & `?format=prometheus` requires admin auth)
+    let (unauth_met_st, _) = send_json(&app, Method::GET, "/v1/sys/metrics", &[], None).await;
+    assert_eq!(unauth_met_st, StatusCode::UNAUTHORIZED);
+
+    let (met_st, met_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/metrics",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(met_st, StatusCode::OK);
+    assert_eq!(met_body["active_oidc_bindings_count"], 1);
+    assert_eq!(met_body["jwks_cached_keys_count"], 1);
+    assert_eq!(met_body["total_secrets_count"], 2);
+
+    let (prom_st, prom_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/metrics?format=prometheus",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(prom_st, StatusCode::OK);
+    let prom_raw = prom_body["raw"].as_str().expect("prometheus text");
+    assert!(prom_raw.contains("vault_oidc_bindings_active 1"));
+    assert!(prom_raw.contains("vault_oidc_jwks_keys_cached 1"));
+
+    // 9. Revoking the OIDC binding immediately invalidates the JWT (`401 Unauthorized`)
+    let (del_oid_st, _) = send_json(
+        &app,
+        Method::DELETE,
+        &format!("/v1/sys/oidc/bindings/{binding_id}"),
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(del_oid_st, StatusCode::NO_CONTENT);
+
+    let (post_del_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/apps/jellyfin/api_key",
+        &[("Authorization", &bearer_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(post_del_st, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_native_tls_rustls_encryption_in_transit() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (_dir, _state, app, _unseal_key, _admin_token) = bootstrap_test_vault().await;
+
+    // 1. Generate autonomous self-signed certificate for localhost/127.0.0.1
+    let (cert_pem, key_pem, fp) = sovereign_vault::crypto::generate_self_signed_tls_cert(&[
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .expect("generate test tls cert");
+    assert_eq!(fp.split(':').count(), 32);
+
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
+        cert_pem.as_bytes().to_vec(),
+        key_pem.as_bytes().to_vec(),
+    )
+    .await
+    .expect("load rustls config");
+
+    // 2. Bind to an ephemeral port on 127.0.0.1
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("get local addr");
+    drop(listener); // Free for axum-server
+
+    let server_handle = tokio::spawn(async move {
+        let _ = axum_server::bind_rustls(addr, rustls_config)
+            .serve(app.into_make_service())
+            .await;
+    });
+
+    // Wait briefly for server startup
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 3. Client connecting with CA cert verification succeeds
+    let root_cert =
+        reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root cert");
+    let trusted_client = reqwest::Client::builder()
+        .add_root_certificate(root_cert)
+        .build()
+        .expect("build client");
+
+    let resp = trusted_client
+        .get(format!("https://localhost:{}/v1/sys/health", addr.port()))
+        .send()
+        .await
+        .expect("https request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 4. Client connecting with -k / danger_accept_invalid_certs succeeds
+    let insecure_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .expect("build insecure client");
+
+    let resp2 = insecure_client
+        .get(format!("https://127.0.0.1:{}/v1/sys/health", addr.port()))
+        .send()
+        .await
+        .expect("https request");
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+
+    // 5. Plain HTTP request to TLS port is rejected / fails handshake
+    let plain_client = reqwest::Client::new();
+    let plain_fail = plain_client
+        .get(format!("http://127.0.0.1:{}/v1/sys/health", addr.port()))
+        .send()
+        .await;
+    assert!(plain_fail.is_err(), "Cleartext HTTP to TLS port must fail");
+
+    server_handle.abort();
+}

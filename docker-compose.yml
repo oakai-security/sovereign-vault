@@ -15,19 +15,21 @@ services:
       memlock:
         soft: 67108864
         hard: 67108864
-    # Reverse-proxy loopback pattern:
-    # Bind strictly to 127.0.0.1:8443 on `lo` (never 0.0.0.0 / LAN / VPN interfaces),
-    # bypassing Docker bridge/VPN firewall drops while terminating TLS at host Caddy / Nginx.
-    # (If running Caddy in a sibling container instead of on the host, replace `network_mode: host`
-    #  with a shared `internal: true` Docker network and `--bind 0.0.0.0:8443`.)
+    # Native TLS 1.3 Mode:
+    # Encrypted in transit by default (NIC-to-NIC wire encryption) using Rustls.
+    # An autonomous self-signed ECDSA certificate is generated on first boot if custom certs are omitted.
     network_mode: host
-    command: ["daemon", "--data-dir", "/data", "--bind", "127.0.0.1:8443"]
-    # Standalone mode is 100% air-gapped (zero outbound calls).
-    # Uncomment ONLY for Enterprise Fleet telemetry opt-in:
-    # environment:
-    #   - OAKAI_ENTERPRISE_LICENSE=${OAKAI_ENTERPRISE_LICENSE}
-    #   - OAKAI_TELEMETRY_ENABLED=true
-    #   - OAKAI_CLUSTER_ID=cls_local_dev
+    command: ["daemon", "--data-dir", "/data", "--bind", "0.0.0.0:8443"]
+    environment:
+      - SOVEREIGN_VAULT_TLS_SANS=${SOVEREIGN_VAULT_TLS_SANS:-localhost,127.0.0.1,vault.local}
+      # Custom enterprise TLS certificates can be mounted and provided via:
+      # - SOVEREIGN_VAULT_TLS_CERT=/data/tls/custom_cert.pem
+      # - SOVEREIGN_VAULT_TLS_KEY=/data/tls/custom_key.pem
+      #
+      # Enterprise Fleet telemetry opt-in:
+      # - OAKAI_ENTERPRISE_LICENSE=${OAKAI_ENTERPRISE_LICENSE}
+      # - OAKAI_TELEMETRY_ENABLED=true
+      # - OAKAI_CLUSTER_ID=cls_local_dev
     volumes:
       - vault-data:/data
 

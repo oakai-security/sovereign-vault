@@ -1,16 +1,16 @@
 [package]
 name = "sovereign-vault"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Oakai Security <security@oakai-security.com>"]
-description = "Single-binary, zero-account, containerized Micro-KMS with SQLCipher encrypted volume storage, SHA-512 machine tokens, and memory-pinned unsealing."
+description = "Single-binary, zero-account, containerized Micro-KMS with SQLCipher encrypted volume storage, Universal OIDC workload identity, SHA-512 machine tokens, and memory-pinned unsealing."
 license = "Apache-2.0"
 repository = "https://github.com/oakai-security/sovereign-vault"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["tokio"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
@@ -19,12 +19,17 @@ sha2 = "0.10"
 hkdf = "0.12"
 subtle = "2.6"
 rand = "0.8"
+ring = "0.17"
+base64 = "0.22"
 zeroize = { version = "1.8", features = ["derive"] }
 rpassword = "7.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "1.0"
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

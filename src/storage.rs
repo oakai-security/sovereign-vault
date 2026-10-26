@@ -4,9 +4,11 @@ use crate::acl::ScopedToken;
 use crate::crypto::{
     compute_audit_chain_mac, constant_time_str_eq, hex_encode, EnvelopeHeader, LockedKey,
 };
+use crate::oidc::OidcBinding;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use zeroize::Zeroizing;
 const ENVELOPE_FILENAME: &str = "vault.envelope";
 const DB_FILENAME: &str = "vault.db";
 const AUDIT_GENESIS_MAC: &str = "GENESIS_SOVEREIGN_VAULT_V2";
+const MAX_BACKUP_SNAPSHOTS: usize = 20;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -98,6 +101,11 @@ pub fn is_vault_initialized(data_dir: &Path) -> bool {
     envelope_path(data_dir).is_file() && database_path(data_dir).is_file()
 }
 
+/// Detect split-file partial initialization (`vault.envelope` exists without `vault.db`, or vice versa).
+pub fn has_partial_initialization(data_dir: &Path) -> bool {
+    envelope_path(data_dir).is_file() ^ database_path(data_dir).is_file()
+}
+
 /// Atomically persist `/data/vault.envelope` with strict `0600` permissions.
 pub fn write_envelope_header(data_dir: &Path, header: &EnvelopeHeader) -> Result<(), StorageError> {
     ensure_secure_dir(data_dir)?;
@@ -160,6 +168,8 @@ impl Storage {
             "PRAGMA cipher_page_size = 4096;
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
              PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
+             PRAGMA cipher_memory_security = ON;
+             PRAGMA secure_delete = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
              PRAGMA foreign_keys = ON;
@@ -192,6 +202,21 @@ impl Storage {
                  allowed_paths TEXT NOT NULL,
                  capabilities TEXT NOT NULL,
                  expires_at INTEGER,
+                 created_at INTEGER NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS oidc_bindings (
+                 binding_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 project TEXT NOT NULL,
+                 issuer TEXT NOT NULL,
+                 audience TEXT NOT NULL,
+                 jwks_uri TEXT NOT NULL,
+                 subject_claim TEXT NOT NULL,
+                 subject_pattern TEXT NOT NULL,
+                 allowed_paths TEXT NOT NULL,
+                 capabilities TEXT NOT NULL,
+                 inline_jwks_json TEXT,
                  created_at INTEGER NOT NULL
              );
 
@@ -264,14 +289,37 @@ impl Storage {
     }
 
     pub fn get_secret(&self, path: &str) -> Result<Option<StoredSecretRecord>, StorageError> {
-        let row: Option<(String, i64, Vec<u8>, Vec<u8>)> = self
-            .conn
-            .query_row(
-                "SELECT project, current_version, ciphertext, nonce FROM secrets WHERE path = ?",
-                params![path],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
+        self.get_secret_version(path, None)
+    }
+
+    /// Retrieve either the active version (`version = None`) or a specific historical version (`Some(v)`)
+    /// for an active secret path.
+    pub fn get_secret_version(
+        &self,
+        path: &str,
+        version: Option<i64>,
+    ) -> Result<Option<StoredSecretRecord>, StorageError> {
+        let row: Option<(String, i64, Vec<u8>, Vec<u8>)> = match version {
+            None => self
+                .conn
+                .query_row(
+                    "SELECT project, current_version, ciphertext, nonce FROM secrets WHERE path = ?",
+                    params![path],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?,
+            Some(ver) => self
+                .conn
+                .query_row(
+                    "SELECT sv.project, sv.version, sv.ciphertext, sv.nonce
+                     FROM secret_versions sv
+                     INNER JOIN secrets s ON s.path = sv.path
+                     WHERE sv.path = ? AND sv.version = ?",
+                    params![path, ver],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?,
+        };
 
         match row {
             Some((project, version, ciphertext, nonce_vec)) => {
@@ -293,10 +341,13 @@ impl Storage {
         }
     }
 
-    pub fn delete_secret(&self, path: &str) -> Result<bool, StorageError> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM secrets WHERE path = ?", params![path])?;
+    /// Cryptographically shred a secret path from both `secrets` and `secret_versions`
+    /// inside an atomic transaction (`PRAGMA secure_delete = ON` overwrites freed SQLCipher pages).
+    pub fn delete_secret(&mut self, path: &str) -> Result<bool, StorageError> {
+        let tx = self.conn.transaction()?;
+        let _ = tx.execute("DELETE FROM secret_versions WHERE path = ?", params![path])?;
+        let affected = tx.execute("DELETE FROM secrets WHERE path = ?", params![path])?;
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -375,6 +426,132 @@ impl Storage {
             .conn
             .execute("DELETE FROM tokens WHERE token_id = ?", params![token_id])?;
         Ok(affected > 0)
+    }
+
+    /// Persist a new OIDC Workload Identity Binding into SQLCipher.
+    pub fn put_oidc_binding(&self, binding: &OidcBinding) -> Result<(), StorageError> {
+        let paths_json = serde_json::to_string(&binding.allowed_paths)?;
+        let caps_json = serde_json::to_string(&binding.capabilities)?;
+        self.conn.execute(
+            "INSERT INTO oidc_bindings (
+                 binding_id, name, project, issuer, audience, jwks_uri,
+                 subject_claim, subject_pattern, allowed_paths, capabilities,
+                 inline_jwks_json, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(binding_id) DO UPDATE SET
+                 name = excluded.name,
+                 project = excluded.project,
+                 issuer = excluded.issuer,
+                 audience = excluded.audience,
+                 jwks_uri = excluded.jwks_uri,
+                 subject_claim = excluded.subject_claim,
+                 subject_pattern = excluded.subject_pattern,
+                 allowed_paths = excluded.allowed_paths,
+                 capabilities = excluded.capabilities,
+                 inline_jwks_json = excluded.inline_jwks_json",
+            params![
+                binding.binding_id,
+                binding.name,
+                binding.project,
+                binding.issuer,
+                binding.audience,
+                binding.jwks_uri,
+                binding.subject_claim,
+                binding.subject_pattern,
+                paths_json,
+                caps_json,
+                binding.inline_jwks_json,
+                binding.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List all configured OIDC Workload Identity Bindings.
+    pub fn list_oidc_bindings(&self) -> Result<Vec<OidcBinding>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT binding_id, name, project, issuer, audience, jwks_uri,
+                    subject_claim, subject_pattern, allowed_paths, capabilities,
+                    inline_jwks_json, created_at
+             FROM oidc_bindings ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let paths_str: String = r.get(8)?;
+            let caps_str: String = r.get(9)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                paths_str,
+                caps_str,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, i64>(11)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                binding_id,
+                name,
+                project,
+                issuer,
+                audience,
+                jwks_uri,
+                subject_claim,
+                subject_pattern,
+                paths_str,
+                caps_str,
+                inline_jwks_json,
+                created_at,
+            ) = row?;
+            out.push(OidcBinding {
+                binding_id,
+                name,
+                project,
+                issuer,
+                audience,
+                jwks_uri,
+                subject_claim,
+                subject_pattern,
+                allowed_paths: serde_json::from_str(&paths_str)?,
+                capabilities: serde_json::from_str(&caps_str)?,
+                inline_jwks_json,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Delete an OIDC Workload Identity Binding by `binding_id`.
+    pub fn delete_oidc_binding(&self, binding_id: &str) -> Result<bool, StorageError> {
+        let affected = self.conn.execute(
+            "DELETE FROM oidc_bindings WHERE binding_id = ?",
+            params![binding_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Count active OIDC Workload Identity Bindings.
+    pub fn count_oidc_bindings(&self) -> Result<u64, StorageError> {
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM oidc_bindings", [], |r| r.get(0))?;
+        Ok(count as u64)
+    }
+
+    /// Return the latest audit sequence number (`0` if empty).
+    pub fn latest_audit_seq(&self) -> Result<u64, StorageError> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(seq) FROM audit_log", [], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(seq.unwrap_or(0) as u64)
     }
 
     /// Return aggregate operational counts `(total_secrets, active_unexpired_tokens, db_bytes)`
@@ -456,7 +633,7 @@ impl Storage {
         actor: &str,
         resource: &str,
         outcome: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<AuditLogEntry, StorageError> {
         let now = now_unix_seconds();
         let tx = self.conn.transaction()?;
         let last: Option<(i64, String)> = tx
@@ -489,7 +666,16 @@ impl Storage {
             params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(AuditLogEntry {
+            seq,
+            timestamp: now,
+            event_type: event_type.to_string(),
+            actor: actor.to_string(),
+            resource: resource.to_string(),
+            outcome: outcome.to_string(),
+            prev_mac_sha512: prev_mac,
+            entry_mac_sha512: entry_mac,
+        })
     }
 
     /// Recompute and verify the entire HMAC-SHA512 hash chain from genesis (`seq = 1..=N`),
@@ -516,10 +702,12 @@ impl Storage {
             })
         })?;
 
-        let mut all = Vec::new();
+        let cap = limit.clamp(1, 500);
+        let mut tail_ring: VecDeque<AuditLogEntry> = VecDeque::with_capacity(cap);
         let mut expected_seq = 1i64;
         let mut expected_prev = AUDIT_GENESIS_MAC.to_string();
         let mut valid = true;
+        let mut total = 0u64;
 
         for row in rows {
             let entry = row?;
@@ -543,21 +731,29 @@ impl Storage {
             }
             expected_seq += 1;
             expected_prev = entry.entry_mac_sha512.clone();
-            all.push(entry);
+            total += 1;
+            if tail_ring.len() == cap {
+                tail_ring.pop_front();
+            }
+            tail_ring.push_back(entry);
         }
 
-        let total = all.len() as u64;
-        let cap = limit.clamp(1, 500);
-        let tail = if all.len() > cap {
-            all.split_off(all.len() - cap)
-        } else {
-            all
-        };
-        Ok((valid, total, tail))
+        Ok((valid, total, tail_ring.into_iter().collect()))
+    }
+
+    /// Count historical rows in `secret_versions` for a given `path`.
+    pub fn count_secret_versions(&self, path: &str) -> Result<i64, StorageError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM secret_versions WHERE path = ?",
+            params![path],
+            |r| r.get(0),
+        )?;
+        Ok(count)
     }
 
     /// Perform an online encrypted backup by checkpointing WAL frames into `vault.db`
-    /// and copying `vault.db` + `vault.envelope` into a `0700`/`0600` snapshot directory.
+    /// and streaming `vault.db` + `vault.envelope` into a `0700`/`0600` snapshot directory.
+    /// Automatically prunes oldest snapshots beyond `MAX_BACKUP_SNAPSHOTS`.
     pub fn create_encrypted_backup(&self) -> Result<BackupMetadata, StorageError> {
         self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
@@ -577,6 +773,8 @@ impl Storage {
         let db_bytes = copy_file_0600_synced(&self.db_path, &dst_db)?;
         let env_bytes = copy_file_0600_synced(&envelope_path(&self.data_dir), &dst_env)?;
 
+        prune_excess_backups(&backups_root, MAX_BACKUP_SNAPSHOTS);
+
         Ok(BackupMetadata {
             snapshot_id,
             backup_dir: snap_dir.to_string_lossy().to_string(),
@@ -586,10 +784,30 @@ impl Storage {
 }
 
 fn copy_file_0600_synced(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    let bytes = fs::read(src)?;
-    let mut f = fs::File::create(dst)?;
+    let mut src_file = fs::File::open(src)?;
+    let mut dst_file = fs::File::create(dst)?;
     set_mode_0600(dst)?;
-    f.write_all(&bytes)?;
-    f.sync_all()?;
-    Ok(bytes.len() as u64)
+    let copied = std::io::copy(&mut src_file, &mut dst_file)?;
+    dst_file.flush()?;
+    dst_file.sync_all()?;
+    Ok(copied)
+}
+
+fn prune_excess_backups(backups_root: &Path, keep_max: usize) {
+    let Ok(entries) = fs::read_dir(backups_root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    if dirs.len() <= keep_max {
+        return;
+    }
+    dirs.sort();
+    let remove_count = dirs.len().saturating_sub(keep_max);
+    for old_dir in dirs.into_iter().take(remove_count) {
+        let _ = fs::remove_dir_all(old_dir);
+    }
 }
