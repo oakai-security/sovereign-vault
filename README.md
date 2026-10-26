@@ -79,8 +79,8 @@ docker exec -it sovereign-vault sovereign-vault init
 ### 3. Enroll a Universal OIDC Trust Binding (Preset Mode)
 Allow GitHub Actions, Kubernetes ServiceAccounts, or local Dex/Authelia workloads to authenticate using short-lived OIDC JWTs (`Authorization: Bearer <jwt>`) with zero static tokens:
 ```bash
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+# Provide the admin token securely via OS keyring (Linux Secret Service / macOS Keychain / Windows Credential Guard):
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault oidc enroll \
     --preset github \
     --project payments \
@@ -91,15 +91,13 @@ python3 python3 -m keyring \
     --token-stdin
 
 # Trigger an ad-hoc JWKS cache refresh at any time (in addition to the automatic 15m refresh)
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault oidc refresh --token-stdin
 ```
 
 ### 4. Enroll a Scoped Machine Token (Dual-Mode Fallback)
 ```bash
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault token enroll \
     --project jellyfin \
     --name jellyfin-prod-01 \
@@ -112,8 +110,7 @@ python3 python3 -m keyring \
 Inject secrets directly into a child process in memory (`run`) or render a `0600` `.env` file into an in-memory `tmpfs` volume (`export`) using either an OIDC JWT (`--token-file`) or a machine token:
 ```bash
 # Direct child process injection (zero .env files on disk)
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault run \
     --map DB_PASSWORD=apps/jellyfin/db_pass \
     --token-stdin -- env
@@ -131,26 +128,22 @@ docker exec sovereign-vault sovereign-vault metrics --prometheus
 ### 5. Online Encrypted Backup & Tamper-Evident Audit Verification
 ```bash
 # Create an atomic 0600 SQLCipher snapshot in /data/backups/
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault backup --token-stdin
 
 # Verify full RFC 2104 HMAC-SHA512 hash-chained audit history
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault audit --limit 50 --token-stdin
 ```
 
 ### 6. Seal & Auto-Unseal Verification
 ```bash
 # Seal vault (drops SQLCipher connection & scrubs mlock'd RAM pages)
-python3 python3 -m keyring \
-  get sovereign-vault admin-token | \
+python3 -m keyring get sovereign-vault admin-token | \
   docker exec -i sovereign-vault sovereign-vault seal --token-stdin
 
-# Unseal cleanly via stdin pipe from Ubuntu Secret Service
-python3 python3 -m keyring \
-  get sovereign-vault unseal-key | \
+# Unseal cleanly via stdin pipe from OS keyring
+python3 -m keyring get sovereign-vault unseal-key | \
   docker exec -i sovereign-vault sovereign-vault unseal --stdin
 ```
 

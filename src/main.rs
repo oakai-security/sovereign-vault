@@ -215,10 +215,10 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         interval_secs: u64,
 
-        /// Shell command whose stdout outputs the 64-hex unseal key (e.g. secret_service.py get sovereign-vault unseal-key)
+        /// Shell command whose stdout outputs the 64-hex unseal key (e.g. python3 -m keyring get sovereign-vault unseal-key)
         #[arg(
             long,
-            default_value = "python3 python3 -m keyring get sovereign-vault unseal-key"
+            default_value = "python3 -m keyring get sovereign-vault unseal-key"
         )]
         key_cmd: String,
     },

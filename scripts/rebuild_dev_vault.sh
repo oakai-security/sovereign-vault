@@ -7,7 +7,6 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SECRET_PY="python3 -m keyring"
 AUTO_INIT="false"
 
 for arg in "$@"; do
@@ -69,23 +68,23 @@ if [[ "$AUTO_INIT" == "true" ]]; then
     INIT_JSON="$(printf '%s' "$NONCE" | docker exec -i sovereign-vault sovereign-vault -k init --nonce-stdin)"
     unset NONCE
 
-    if [[ -f "$SECRET_PY" ]]; then
+    if python3 -c 'import keyring' >/dev/null 2>&1; then
         python3 -c '
 import json, sys, keyring
 data = json.loads(sys.stdin.read())
 keyring.set_password("sovereign-vault", "unseal-key", data["unseal_key"])
 keyring.set_password("sovereign-vault", "admin-token", data["admin_token"])
-print("[auto-init] Stored unseal-key and admin-token (" + data["admin_token_id"] + ") in Ubuntu Secret Service (keyring).")
+print("[auto-init] Stored unseal-key and admin-token (" + data["admin_token_id"] + ") in OS Keyring.")
 key = data["unseal_key"]
 import requests
-r = requests.post("http://127.0.0.1:8443/v1/sys/unseal", json={"unseal_key": key}, timeout=5)
+r = requests.post("https://127.0.0.1:8443/v1/sys/unseal", json={"unseal_key": key}, verify=False, timeout=5)
 if r.status_code == 200:
     print("[auto-init] Vault successfully unsealed and active!")
 else:
     print(f"[auto-init] WARNING: Unseal returned status {r.status_code}: {r.text}")
 ' <<<"$INIT_JSON"
     else
-        echo "[auto-init] WARNING: secret_service.py not found; printing bootstrap output once:"
+        echo "[auto-init] python keyring library not detected; printing bootstrap output once:"
         printf '%s\n' "$INIT_JSON"
     fi
     unset INIT_JSON

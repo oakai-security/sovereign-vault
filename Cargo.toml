@@ -6,6 +6,11 @@ authors = ["Oakai Security <security@oakai-security.com>"]
 description = "Single-binary, zero-account, containerized Micro-KMS with SQLCipher encrypted volume storage, Universal OIDC workload identity, SHA-512 machine tokens, and memory-pinned unsealing."
 license = "Apache-2.0"
 repository = "https://github.com/oakai-security/sovereign-vault"
+homepage = "https://oakai-security.com"
+documentation = "https://oakai-security.com/docs/quickstart"
+readme = "README.md"
+keywords = ["vault", "kms", "secrets", "oidc", "sqlcipher"]
+categories = ["cryptography", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }

@@ -1,7 +1,7 @@
 # Sovereign Vault v0.2 — Cryptographic & Runtime Architecture
 
-**Version**: `0.2.0`  
-**Related Specs**: [`SPEC-014`](SPEC-014), [`ADR-0008`](ADR-0008)
+**Version**: `0.3.0`  
+**Architecture Spec**: SPEC-014 (Micro-KMS Architecture), ADR-0008 (Zero-Trust BYOC & Hardware Enclaves)
 
 ---
 
