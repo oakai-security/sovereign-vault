@@ -1,6 +1,6 @@
 [package]
 name = "sovereign-vault"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Oakai Security <security@oakai-security.com>"]
 description = "Single-binary, zero-account, containerized Micro-KMS with SQLCipher encrypted volume storage, Universal OIDC workload identity, SHA-512 machine tokens, and memory-pinned unsealing."

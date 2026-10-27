@@ -20,7 +20,7 @@ A clear and concise description of what you expected to happen.
 
 **Environment:**
  - OS: [e.g. Linux x86_64, macOS arm64]
- - Sovereign Vault version: [e.g. 0.3.0]
+ - Sovereign Vault version: [e.g. 1.0.0]
  - Deployment method: [e.g. Docker, native binary]
 
 **Additional context**

@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Organization](https://img.shields.io/badge/Org-oakai--security-orange.svg)](https://oakai-security.com)
-[![Version](https://img.shields.io/badge/Version-0.3.0-purple.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/Version-1.0.0-purple.svg)](Cargo.toml)
 
 **Sovereign Vault** is a single-binary, zero-account, containerized **Micro-KMS & Universal OIDC Secret Broker** engineered for developer speed, homelab workload federation, and enterprise BYOC (Bring Your Own Cloud) operations.
 
