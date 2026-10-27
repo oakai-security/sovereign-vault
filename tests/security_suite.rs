@@ -45,9 +45,8 @@ async fn send_json(
     if bytes.is_empty() {
         (status, Value::Null)
     } else {
-        let parsed = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
-            json!({ "raw": String::from_utf8_lossy(&bytes).to_string() })
-        });
+        let parsed = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
         (status, parsed)
     }
 }
@@ -189,7 +188,14 @@ async fn test_mandatory_default_deny_authentication() {
     assert_eq!(st, StatusCode::OK);
 
     // Every data & admin endpoint MUST reject unauthenticated requests with 401
-    let (get_st, _) = send_json(&app, Method::GET, "/v1/secret/infra/dns/api_token", &[], None).await;
+    let (get_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/infra/dns/api_token",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(get_st, StatusCode::UNAUTHORIZED);
 
     let (put_st, _) = send_json(
@@ -202,8 +208,14 @@ async fn test_mandatory_default_deny_authentication() {
     .await;
     assert_eq!(put_st, StatusCode::UNAUTHORIZED);
 
-    let (del_st, _) =
-        send_json(&app, Method::DELETE, "/v1/secret/infra/dns/api_token", &[], None).await;
+    let (del_st, _) = send_json(
+        &app,
+        Method::DELETE,
+        "/v1/secret/infra/dns/api_token",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(del_st, StatusCode::UNAUTHORIZED);
 
     let (enroll_st, _) = send_json(
@@ -731,8 +743,14 @@ async fn test_concurrent_health_and_secret_read_write_stress() {
             assert_eq!(h_st, StatusCode::OK);
             assert_eq!(h_body["sealed"], false);
 
-            let (g_st, g_body) =
-                send_json(&router, Method::GET, &path, &[("X-Vault-Token", &tok)], None).await;
+            let (g_st, g_body) = send_json(
+                &router,
+                Method::GET,
+                &path,
+                &[("X-Vault-Token", &tok)],
+                None,
+            )
+            .await;
             assert_eq!(g_st, StatusCode::OK);
             assert_eq!(g_body["value"], format!("val-{i}"));
         }));
@@ -1102,8 +1120,7 @@ async fn test_native_tls_rustls_encryption_in_transit() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // 3. Client connecting with CA cert verification succeeds
-    let root_cert =
-        reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root cert");
+    let root_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root cert");
     let trusted_client = reqwest::Client::builder()
         .add_root_certificate(root_cert)
         .build()

@@ -116,12 +116,7 @@ impl ScopedToken {
 
     /// Check whether this token is unexpired, holds `required_cap` (or `admin`),
     /// and is permitted to access `canonical_path` along exact directory boundaries.
-    pub fn is_path_allowed(
-        &self,
-        canonical_path: &str,
-        required_cap: &str,
-        now_unix: i64,
-    ) -> bool {
+    pub fn is_path_allowed(&self, canonical_path: &str, required_cap: &str, now_unix: i64) -> bool {
         if let Some(exp) = self.expires_at {
             if now_unix >= exp {
                 return false;

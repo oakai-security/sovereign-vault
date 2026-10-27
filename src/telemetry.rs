@@ -293,7 +293,10 @@ pub fn maybe_spawn_telemetry_worker(
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to initialize enterprise telemetry HTTP client: {}", e);
+                tracing::warn!(
+                    "Failed to initialize enterprise telemetry HTTP client: {}",
+                    e
+                );
                 return;
             }
         };

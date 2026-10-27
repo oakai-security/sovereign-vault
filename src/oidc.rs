@@ -11,9 +11,7 @@
 //! Cryptographic verification uses pure-Rust `ring::signature` (`RS256`, `RS384`, `RS512`,
 //! `ES256`, `ES384`, and `EdDSA` / Ed25519) with zero OpenSSL or C library bloat.
 
-use crate::acl::{
-    validate_capabilities, validate_identifier, validate_scope_pattern, ScopedToken,
-};
+use crate::acl::{validate_capabilities, validate_identifier, validate_scope_pattern, ScopedToken};
 use crate::storage::now_unix_seconds;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -137,7 +135,9 @@ impl OidcPreset {
                 let iss = custom_issuer
                     .map(|s| s.trim().trim_end_matches('/'))
                     .filter(|s| !s.is_empty())
-                    .ok_or("Authelia preset requires --issuer URL (e.g. https://auth.chesty.home)")?;
+                    .ok_or(
+                        "Authelia preset requires --issuer URL (e.g. https://auth.chesty.home)",
+                    )?;
                 Ok((
                     iss.to_string(),
                     format!("{iss}/jwks.json"),
@@ -302,10 +302,7 @@ impl OidcJwksCache {
 
     /// Refresh all unique issuers from the provided `OidcBinding` list.
     /// Inline JWKS bindings are loaded directly in memory; remote `jwks_uri` bindings are fetched via HTTPS/HTTP.
-    pub async fn refresh_bindings(
-        &self,
-        bindings: &[OidcBinding],
-    ) -> Vec<IssuerRefreshReport> {
+    pub async fn refresh_bindings(&self, bindings: &[OidcBinding]) -> Vec<IssuerRefreshReport> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -416,7 +413,10 @@ async fn fetch_remote_jwks(
     }
 
     // Fallback: auto-discover via /.well-known/openid-configuration
-    let well_known = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+    let well_known = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
     let disc_resp = client
         .get(&well_known)
         .send()
@@ -680,8 +680,8 @@ pub fn verify_oidc_jwt_and_resolve(
     let header_bytes = URL_SAFE_NO_PAD
         .decode(header_b64)
         .map_err(|_| OidcError::InvalidBase64)?;
-    let header: JwtHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|e| OidcError::InvalidJson(e.to_string()))?;
+    let header: JwtHeader =
+        serde_json::from_slice(&header_bytes).map_err(|e| OidcError::InvalidJson(e.to_string()))?;
 
     // Strict algorithm allowlist — block `none` and symmetric `HS*` key confusion attacks
     if !matches!(
@@ -814,9 +814,7 @@ fn jwt_audience_matches(claims: &serde_json::Value, expected_aud: &str) -> bool 
     }
     match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == expected_aud,
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().any(|v| v.as_str() == Some(expected_aud))
-        }
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(expected_aud)),
         _ => false,
     }
 }

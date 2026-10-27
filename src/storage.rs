@@ -154,7 +154,10 @@ impl Storage {
     /// Open or create the SQLCipher-encrypted database inside `data_dir` using the 256-bit `sqlcipher_key`.
     /// Every 4KB database page (including table schemas, path indices, and WAL frames) is encrypted
     /// via AES-256 and authenticated with `HMAC_SHA512`.
-    pub fn open_encrypted(data_dir: &Path, sqlcipher_key: &LockedKey) -> Result<Self, StorageError> {
+    pub fn open_encrypted(
+        data_dir: &Path,
+        sqlcipher_key: &LockedKey,
+    ) -> Result<Self, StorageError> {
         ensure_secure_dir(data_dir)?;
         let db_path = database_path(data_dir);
         let conn = Connection::open(&db_path)?;
@@ -538,9 +541,9 @@ impl Storage {
 
     /// Count active OIDC Workload Identity Bindings.
     pub fn count_oidc_bindings(&self) -> Result<u64, StorageError> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM oidc_bindings", [], |r| r.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM oidc_bindings", [], |r| r.get(0))?;
         Ok(count as u64)
     }
 
@@ -558,9 +561,9 @@ impl Storage {
     /// for opt-in Enterprise Telemetry (never exposes secret names, paths, or values).
     pub fn operational_counts(&self) -> Result<(u64, u64, u64), StorageError> {
         let now = now_unix_seconds();
-        let secrets_count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM secrets", [], |r| r.get(0))?;
+        let secrets_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM secrets", [], |r| r.get(0))?;
         let tokens_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM tokens WHERE expires_at IS NULL OR expires_at > ?",
             params![now],
@@ -650,14 +653,7 @@ impl Storage {
         };
 
         let entry_mac = compute_audit_chain_mac(
-            audit_key,
-            &prev_mac,
-            seq,
-            now,
-            event_type,
-            actor,
-            resource,
-            outcome,
+            audit_key, &prev_mac, seq, now, event_type, actor, resource, outcome,
         );
 
         tx.execute(
@@ -755,7 +751,8 @@ impl Storage {
     /// and streaming `vault.db` + `vault.envelope` into a `0700`/`0600` snapshot directory.
     /// Automatically prunes oldest snapshots beyond `MAX_BACKUP_SNAPSHOTS`.
     pub fn create_encrypted_backup(&self) -> Result<BackupMetadata, StorageError> {
-        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
         let now = now_unix_seconds();
         let mut suffix = [0u8; 4];

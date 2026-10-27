@@ -70,7 +70,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(data_dir: PathBuf, bootstrap_nonce: Option<String>, telemetry_enabled: bool) -> Self {
+    pub fn new(
+        data_dir: PathBuf,
+        bootstrap_nonce: Option<String>,
+        telemetry_enabled: bool,
+    ) -> Self {
         Self::with_rate_limit(
             data_dir,
             bootstrap_nonce,
@@ -104,10 +108,7 @@ impl AppState {
         self
     }
 
-    fn check_window(
-        queue: &Mutex<VecDeque<Instant>>,
-        max_failures: usize,
-    ) -> Result<(), ApiError> {
+    fn check_window(queue: &Mutex<VecDeque<Instant>>, max_failures: usize) -> Result<(), ApiError> {
         let mut guard = queue
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Rate limiter lock error"))?;
@@ -449,8 +450,12 @@ fn authenticate_caller(
                 .storage
                 .lock()
                 .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-            db.list_oidc_bindings()
-                .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "OIDC binding lookup error"))?
+            db.list_oidc_bindings().map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "OIDC binding lookup error",
+                )
+            })?
         };
 
         let now = now_unix_seconds();
@@ -511,7 +516,13 @@ fn authenticate_caller(
         None => {
             state.check_token_rate_limit()?;
             state.record_token_auth_failure();
-            record_audit(active, "auth.failed", &token_id, "sys/auth", "unknown_token");
+            record_audit(
+                active,
+                "auth.failed",
+                &token_id,
+                "sys/auth",
+                "unknown_token",
+            );
             return Err(api_err(
                 StatusCode::UNAUTHORIZED,
                 "Unknown or revoked machine token",
@@ -617,7 +628,12 @@ async fn init_handler(
 
     let unseal_key = generate_unseal_key();
     let (envelope_hdr, db_key, value_aead_key, audit_chain_key) = create_envelope(&unseal_key)
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Envelope generation failed"))?;
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Envelope generation failed",
+            )
+        })?;
 
     let db_locked = db_key.is_memory_locked();
     let mut storage = Storage::open_encrypted(&state.data_dir, &db_key).map_err(|_| {
@@ -729,8 +745,12 @@ async fn unseal_handler(
     let mut key_arr = Zeroizing::new([0u8; 32]);
     key_arr.copy_from_slice(&decoded);
 
-    let header = read_envelope_header(&state.data_dir)
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read vault envelope"))?;
+    let header = read_envelope_header(&state.data_dir).map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read vault envelope",
+        )
+    })?;
 
     // Cryptographically verify AEAD tag on wrapped DEK BEFORE opening DB or touching state!
     let (db_key, value_aead_key, audit_chain_key) =
@@ -1398,8 +1418,7 @@ async fn list_secrets_handler(
 
     let canonical_prefix = match query.prefix.as_deref() {
         Some(raw) if !raw.trim().is_empty() => Some(
-            canonicalize_prefix_filter(raw)
-                .map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?,
+            canonicalize_prefix_filter(raw).map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?,
         ),
         _ => None,
     };
@@ -1409,8 +1428,12 @@ async fn list_secrets_handler(
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.list_secrets_metadata()
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret list query failed"))?
+        db.list_secrets_metadata().map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Secret list query failed",
+            )
+        })?
     };
 
     let is_admin = caller.is_admin(now);
@@ -1456,8 +1479,8 @@ async fn enroll_handler(
         ));
     }
 
-    let valid_project =
-        validate_identifier(&payload.project).map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
+    let valid_project = validate_identifier(&payload.project)
+        .map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
     let valid_name =
         validate_identifier(&payload.name).map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
 
@@ -1506,7 +1529,12 @@ async fn enroll_handler(
             &token_id,
             "created",
         )
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist audit event"))?;
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist audit event",
+            )
+        })?;
     }
 
     tracing::info!(
@@ -1641,7 +1669,12 @@ async fn get_secret_handler(
 
     let rec = match record {
         Some(r) => r,
-        None => return Err(api_err(StatusCode::NOT_FOUND, "Secret path or version not found")),
+        None => {
+            return Err(api_err(
+                StatusCode::NOT_FOUND,
+                "Secret path or version not found",
+            ))
+        }
     };
 
     // Non-admin tokens must also match the secret's owning project
@@ -1692,8 +1725,8 @@ async fn put_secret_handler(
 ) -> Result<impl IntoResponse, ApiError> {
     let canon_path =
         canonicalize_secret_path(&raw_path).map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
-    let project =
-        validate_identifier(&payload.project).map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
+    let project = validate_identifier(&payload.project)
+        .map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
 
     let active_guard = state.active.read().await;
     let active = active_guard
@@ -1778,7 +1811,12 @@ async fn put_secret_handler(
             &canon_path,
             &format!("v{next_ver}"),
         )
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist audit event"))?;
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist audit event",
+            )
+        })?;
         next_ver
     };
 

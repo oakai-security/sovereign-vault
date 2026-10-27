@@ -515,14 +515,19 @@ async fn resolve_tls_config(
             let key_file = tls_dir.join("key.pem");
 
             if cert_file.exists() && key_file.exists() {
-                tracing::info!("Reusing existing self-signed TLS credentials in {:?}", tls_dir);
+                tracing::info!(
+                    "Reusing existing self-signed TLS credentials in {:?}",
+                    tls_dir
+                );
                 let c_bytes = tokio::fs::read(&cert_file).await?;
                 let k_bytes = tokio::fs::read(&key_file).await?;
                 let pem_str = String::from_utf8_lossy(&c_bytes);
                 let fp = compute_pem_fingerprint(&pem_str).unwrap_or_else(|| "UNKNOWN".to_string());
                 (c_bytes, k_bytes, fp)
             } else {
-                tracing::info!("Generating autonomous zero-config self-signed ECDSA TLS certificate...");
+                tracing::info!(
+                    "Generating autonomous zero-config self-signed ECDSA TLS certificate..."
+                );
                 let mut sans: Vec<String> = vec![
                     "localhost".to_string(),
                     "127.0.0.1".to_string(),
@@ -559,10 +564,14 @@ async fn resolve_tls_config(
         }
     };
 
-    tracing::info!("================================================================================");
+    tracing::info!(
+        "================================================================================"
+    );
     tracing::info!("TLS 1.3 ACTIVE: Encrypted in transit by default (NIC-to-NIC wire encryption)");
     tracing::info!("Certificate SHA-256 Fingerprint: {}", fp);
-    tracing::info!("================================================================================");
+    tracing::info!(
+        "================================================================================"
+    );
 
     let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert_bytes, key_bytes).await?;
     Ok(config)
@@ -691,7 +700,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             std::fs::create_dir_all(&data_dir)?;
             if lock_process_memory() {
-                tracing::info!("Process address space pinned via mlockall(MCL_CURRENT | MCL_FUTURE).");
+                tracing::info!(
+                    "Process address space pinned via mlockall(MCL_CURRENT | MCL_FUTURE)."
+                );
             }
             let is_init = is_vault_initialized(&data_dir);
 
@@ -895,7 +906,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("Environment variable name in --map cannot be empty".into());
                 }
                 let resp = client
-                    .get(format!("{base}/v1/secret/{}", secret_path.trim_start_matches('/')))
+                    .get(format!(
+                        "{base}/v1/secret/{}",
+                        secret_path.trim_start_matches('/')
+                    ))
                     .header("X-Vault-Token", tok.as_str())
                     .send()
                     .await?;
@@ -906,7 +920,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let sec: SecretResponse = resp.json().await?;
-                resolved_envs.push((env_key.trim().to_string(), Zeroizing::new(sec.value.clone())));
+                resolved_envs.push((
+                    env_key.trim().to_string(),
+                    Zeroizing::new(sec.value.clone()),
+                ));
             }
             drop(tok);
 
@@ -1055,7 +1072,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o600))?;
+                        std::fs::set_permissions(
+                            &out_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        )?;
                     }
                     println!(
                         "Enrolled token '{}' written securely (0600) to {:?}",
@@ -1125,12 +1145,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let base = validate_transport_url(&url)?;
                 let admin_tok = resolve_caller_token(token_stdin)?;
-                let inline_jwks_json = match inline_jwks_file {
-                    Some(p) => Some(std::fs::read_to_string(&p).map_err(|e| {
-                        format!("Failed reading --inline-jwks-file {:?}: {e}", p)
-                    })?),
-                    None => None,
-                };
+                let inline_jwks_json =
+                    match inline_jwks_file {
+                        Some(p) => Some(std::fs::read_to_string(&p).map_err(|e| {
+                            format!("Failed reading --inline-jwks-file {:?}: {e}", p)
+                        })?),
+                        None => None,
+                    };
                 let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
                 let resp = client
                     .post(format!("{base}/v1/sys/oidc/bindings"))
@@ -1234,10 +1255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     read_secret_value_input("Paste Secret Value (hidden): ", value_stdin)?;
                 let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
                 let resp = client
-                    .put(format!(
-                        "{base}/v1/secret/{}",
-                        path.trim_start_matches('/')
-                    ))
+                    .put(format!("{base}/v1/secret/{}", path.trim_start_matches('/')))
                     .header("X-Vault-Token", tok.as_str())
                     .json(&serde_json::json!({
                         "project": project,
@@ -1265,10 +1283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tok = resolve_caller_token(token_stdin)?;
                 let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
                 let mut req = client
-                    .get(format!(
-                        "{base}/v1/secret/{}",
-                        path.trim_start_matches('/')
-                    ))
+                    .get(format!("{base}/v1/secret/{}", path.trim_start_matches('/')))
                     .header("X-Vault-Token", tok.as_str());
                 if let Some(ver) = version {
                     req = req.query(&[("version", ver)]);
@@ -1322,10 +1337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tok = resolve_caller_token(token_stdin)?;
                 let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
                 let resp = client
-                    .delete(format!(
-                        "{base}/v1/secret/{}",
-                        path.trim_start_matches('/')
-                    ))
+                    .delete(format!("{base}/v1/secret/{}", path.trim_start_matches('/')))
                     .header("X-Vault-Token", tok.as_str())
                     .send()
                     .await?;
@@ -1367,7 +1379,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                     let unseal_res = client
                                         .post(format!("{base}/v1/sys/unseal"))
-                                        .json(&serde_json::json!({ "unseal_key": key_str.as_str() }))
+                                        .json(
+                                            &serde_json::json!({ "unseal_key": key_str.as_str() }),
+                                        )
                                         .send()
                                         .await;
                                     match unseal_res {

@@ -74,7 +74,11 @@ impl LockedKey {
         unsafe {
             let page_size = {
                 let sz = libc::sysconf(libc::_SC_PAGESIZE);
-                if sz <= 0 { 4096usize } else { sz as usize }
+                if sz <= 0 {
+                    4096usize
+                } else {
+                    sz as usize
+                }
             };
             let alloc_len = page_size.max(32);
 
@@ -344,8 +348,7 @@ pub fn encrypt_secret_with_aad(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<(Vec<u8>, [u8; 12]), CryptoError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptoError::AeadFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptoError::AeadFailure)?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -370,8 +373,7 @@ pub fn decrypt_secret_with_aad(
     nonce_bytes: &[u8; 12],
     aad: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptoError::AeadFailure)?;
+    let cipher = Aes256Gcm::new_from_slice(key.as_bytes()).map_err(|_| CryptoError::AeadFailure)?;
 
     let plaintext = cipher
         .decrypt(
@@ -501,7 +503,8 @@ pub fn compute_pem_fingerprint(pem_str: &str) -> Option<String> {
             b64.clear();
         } else if trimmed == "-----END CERTIFICATE-----" {
             in_cert = false;
-            if let Ok(der_bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            if let Ok(der_bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())
+            {
                 use sha2::{Digest, Sha256};
                 let digest = Sha256::digest(&der_bytes);
                 return Some(
@@ -537,4 +540,3 @@ mod tests {
         assert_eq!(parsed_fp, fingerprint);
     }
 }
-
