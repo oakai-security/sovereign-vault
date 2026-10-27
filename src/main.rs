@@ -1,8 +1,17 @@
-//! Sovereign Vault v0.3: Single-binary Micro-KMS Daemon, Universal OIDC Broker, and Zero-History CLI.
+//! Sovereign Vault v1.0: Single-binary Micro-KMS Daemon, Universal OIDC Broker, and Zero-History CLI.
 //!
 //! All sensitive CLI inputs (bootstrap nonces, unseal keys, machine tokens, OIDC JWTs, and secret values)
 //! are collected exclusively via hidden `/dev/tty` prompts (`rpassword`), `--stdin` pipes, or `0600`
 //! projected files so pasted credentials NEVER enter `~/.bash_history` or `ps aux` process arguments.
+
+#![allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::explicit_counter_loop,
+    clippy::result_unit_err,
+    clippy::manual_is_multiple_of,
+    clippy::large_enum_variant
+)]
 
 use clap::{Parser, Subcommand};
 use rand::RngCore;
