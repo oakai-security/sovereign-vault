@@ -2,3 +2,8 @@ target/
 .git
 .git/
 *.log
+*.db
+*.db-shm
+*.db-wal
+*.envelope
+.env*

@@ -37,6 +37,14 @@ RUN apk add --no-cache ca-certificates libcrypto3 tzdata libgcc && \
 
 COPY --from=builder /app/sovereign-vault /usr/local/bin/sovereign-vault
 
+LABEL org.opencontainers.image.title="Sovereign Vault" \
+      org.opencontainers.image.description="Single-binary, zero-account Micro-KMS with memory protection, SQLCipher encryption, and Universal OIDC federation" \
+      org.opencontainers.image.url="https://oakai-security.com" \
+      org.opencontainers.image.documentation="https://oakai-security.com/docs/quickstart" \
+      org.opencontainers.image.source="https://github.com/oakai-security/sovereign-vault" \
+      org.opencontainers.image.vendor="Oakai Security" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 USER 10001:10001
 WORKDIR /data
 ENV PATH="/usr/local/bin" \
