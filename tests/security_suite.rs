@@ -1,4 +1,4 @@
-//! Integration test suite verifying Sovereign Vault v0.2 cryptographic, authentication,
+//! Integration test suite verifying Sovereign Vault v1.0 cryptographic, authentication,
 //! path-boundary ACL, seal/unseal verification, and air-gapped telemetry guarantees.
 
 use axum::{

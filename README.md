@@ -1,4 +1,4 @@
-# Sovereign Vault (v0.3)
+# Sovereign Vault (v1.0)
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Organization](https://img.shields.io/badge/Org-oakai--security-orange.svg)](https://oakai-security.com)
@@ -10,7 +10,7 @@ Part of the **Oakai Security** (`oakai-security.com`) suite.
 
 ---
 
-## v0.3 Cryptographic, OIDC & Operational Guarantees
+## v1.0 Cryptographic, OIDC & Operational Guarantees
 
 * **Dual-Mode Authentication (`sv_live_*` + Universal OpenID Connect JWTs)**:
   * Automatically routes 3-part dot-separated JWTs (`header.payload.signature`) to the pure-Rust OIDC & JWKS validator (`ring 0.17`), verifying `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, and `EdDSA` (`Ed25519`) signatures with zero OpenSSL bloat.
@@ -56,25 +56,24 @@ vault.internal.company.com {
 
 ---
 
-## Quickstart & Clean Rebuild Loop
+## Quickstart
 
-### 1. Destroy, Wipe, Rebuild & Auto-Init into Ubuntu Secret Service
-During active development or testing, tear down any existing container, wipe the encrypted volume, rebuild from source, and initialize directly into Ubuntu Secret Service (`gnome-keyring`) with zero shell history:
-
+### 1. Start Sovereign Vault via Docker Compose
 ```bash
-./scripts/rebuild_dev_vault.sh --auto-init
+# Clone and start the container (or use pre-built ghcr.io/oakai-security/sovereign-vault:latest)
+docker compose up -d
 ```
 
-*(Omit `--auto-init` if you want a clean uninitialized container to test manual `init` steps.)*
-
-### 2. Manual Zero-History Initialization
+### 2. Zero-History Initialization
 ```bash
-# View the single-use first-boot nonce
+# View the ephemeral first-boot nonce (printed once to stdout)
 docker logs sovereign-vault | grep "Nonce:"
 
 # Run interactive hidden-TTY init (pasted nonce will NOT appear in terminal or ~/.bash_history)
 docker exec -it sovereign-vault sovereign-vault init
 ```
+
+*(For local testing and automated rebuilds with keyring integration, you can also run `./scripts/rebuild_dev_vault.sh --auto-init`)*
 
 ### 3. Enroll a Universal OIDC Trust Binding (Preset Mode)
 Allow GitHub Actions, Kubernetes ServiceAccounts, or local Dex/Authelia workloads to authenticate using short-lived OIDC JWTs (`Authorization: Bearer <jwt>`) with zero static tokens:

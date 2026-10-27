@@ -1,6 +1,6 @@
-# Security Policy & Cryptographic Architecture (`v0.2.0+`)
+# Security Policy & Cryptographic Architecture (`v1.0.0+`)
 
-**Sovereign Vault (`v0.2.0+`)** enforces defense-in-depth across storage, memory, network transport, access control, and auditability.
+**Sovereign Vault (`v1.0.0+`)** enforces defense-in-depth across storage, memory, network transport, access control, and auditability.
 
 ---
 

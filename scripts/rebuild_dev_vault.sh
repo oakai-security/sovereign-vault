@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tear down, wipe encrypted volume storage, rebuild, and cleanly boot Sovereign Vault v0.2.
+# Tear down, wipe encrypted volume storage, rebuild, and cleanly boot Sovereign Vault v1.0.
 #
 # Usage:
 #   ./scripts/rebuild_dev_vault.sh               # Clean uninitialized boot (manual CLI init)
@@ -33,7 +33,7 @@ docker rm -f sovereign-vault >/dev/null 2>&1 || true
 echo "[2/4] Deleting encrypted volume (sovereign_vault_data) for brand-new state..."
 docker volume rm -f sovereign_vault_data >/dev/null 2>&1 || true
 
-echo "[3/4] Building hardened Sovereign Vault v0.2 image & starting on 127.0.0.1:8443..."
+echo "[3/4] Building hardened Sovereign Vault v1.0 image & starting on 127.0.0.1:8443..."
 cd "$REPO_DIR"
 docker compose up -d --build
 
