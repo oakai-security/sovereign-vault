@@ -17,12 +17,13 @@ use clap::{Parser, Subcommand};
 use rand::RngCore;
 use sovereign_vault::{
     crypto::{
-        compute_pem_fingerprint, generate_self_signed_tls_cert, hex_encode, lock_process_memory,
+        build_strict_tls13_server_config, compute_pem_fingerprint, generate_self_signed_tls_cert,
+        hex_encode, lock_process_memory,
     },
     server::{
         self, AppState, AuditLogResponse, EnrollOidcBindingResponse, EnrollTokenResponse,
-        HealthResponse, ListOidcBindingsResponse, ListSecretsResponse, ListTokensResponse,
-        RefreshOidcResponse, SecretResponse,
+        HealthResponse, InitVaultResponse, ListOidcBindingsResponse, ListSecretsResponse,
+        ListTokensResponse, RefreshOidcResponse, RotateUnsealKeyResponse, SecretResponse,
     },
     storage::{is_vault_initialized, BackupMetadata},
     telemetry::{
@@ -36,7 +37,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Parser)]
 #[command(name = "sovereign-vault")]
@@ -109,6 +110,24 @@ enum Commands {
         /// Read 64-hex unseal key from stdin (e.g., piped from Ubuntu Secret Service)
         #[arg(long)]
         stdin: bool,
+    },
+
+    /// Atomically rotate the master unseal key (KEK) on vault.envelope without re-encrypting secrets (requires admin token + current unseal key)
+    RotateUnsealKey {
+        #[arg(long, default_value = "https://127.0.0.1:8443")]
+        url: String,
+
+        /// Read current 64-hex unseal key from stdin instead of hidden TTY prompt
+        #[arg(long)]
+        key_stdin: bool,
+
+        /// Read admin token from stdin instead of hidden TTY prompt (mutually exclusive with --key-stdin)
+        #[arg(long)]
+        token_stdin: bool,
+
+        /// Optional path to a `0600` file containing the caller's admin token
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
 
     /// Seal the vault immediately and scrub RAM keys (requires admin token)
@@ -500,89 +519,103 @@ async fn resolve_tls_config(
     custom_key: Option<PathBuf>,
     custom_sans: Option<String>,
 ) -> Result<axum_server::tls_rustls::RustlsConfig, Box<dyn std::error::Error>> {
-    let (cert_bytes, key_bytes, fp) = match (custom_cert, custom_key) {
-        (Some(cert_path), Some(key_path)) => {
-            tracing::info!(
-                "Loading custom TLS certificate from {:?} and private key from {:?}",
-                cert_path,
-                key_path
-            );
-            let c_bytes = tokio::fs::read(&cert_path).await?;
-            let k_bytes = tokio::fs::read(&key_path).await?;
-            let pem_str = String::from_utf8_lossy(&c_bytes);
-            let fp = compute_pem_fingerprint(&pem_str)
-                .unwrap_or_else(|| "UNKNOWN (could not parse PEM DER)".to_string());
-            (c_bytes, k_bytes, fp)
-        }
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("Both --tls-cert and --tls-key must be provided together.".into());
-        }
-        (None, None) => {
-            let tls_dir = data_dir.join("tls");
-            tokio::fs::create_dir_all(&tls_dir).await?;
-            let cert_file = tls_dir.join("cert.pem");
-            let key_file = tls_dir.join("key.pem");
-
-            if cert_file.exists() && key_file.exists() {
+    let (cert_bytes, key_bytes, fp): (Vec<u8>, Zeroizing<Vec<u8>>, String) =
+        match (custom_cert, custom_key) {
+            (Some(cert_path), Some(key_path)) => {
                 tracing::info!(
-                    "Reusing existing self-signed TLS credentials in {:?}",
-                    tls_dir
+                    "Loading custom TLS certificate from {:?} and private key from {:?}",
+                    cert_path,
+                    key_path
                 );
-                let c_bytes = tokio::fs::read(&cert_file).await?;
-                let k_bytes = tokio::fs::read(&key_file).await?;
+                let c_bytes = tokio::fs::read(&cert_path).await?;
+                let k_bytes = Zeroizing::new(tokio::fs::read(&key_path).await?);
                 let pem_str = String::from_utf8_lossy(&c_bytes);
-                let fp = compute_pem_fingerprint(&pem_str).unwrap_or_else(|| "UNKNOWN".to_string());
+                let fp = compute_pem_fingerprint(&pem_str)
+                    .unwrap_or_else(|| "UNKNOWN (could not parse PEM DER)".to_string());
                 (c_bytes, k_bytes, fp)
-            } else {
-                tracing::info!(
-                    "Generating autonomous zero-config self-signed ECDSA TLS certificate..."
-                );
-                let mut sans: Vec<String> = vec![
-                    "localhost".to_string(),
-                    "127.0.0.1".to_string(),
-                    "::1".to_string(),
-                ];
-                if let Some(extra_sans) = custom_sans {
-                    for s in extra_sans.split(',') {
-                        let trimmed = s.trim();
-                        if !trimmed.is_empty() && !sans.iter().any(|x| x == trimmed) {
-                            sans.push(trimmed.to_string());
-                        }
-                    }
-                }
-                let (cert_pem, key_pem, fp) = generate_self_signed_tls_cert(&sans)
-                    .map_err(|e| format!("Failed generating self-signed TLS cert: {e}"))?;
-                tokio::fs::write(&cert_file, &cert_pem).await?;
-
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err("Both --tls-cert and --tls-key must be provided together.".into());
+            }
+            (None, None) => {
+                let tls_dir = data_dir.join("tls");
+                tokio::fs::create_dir_all(&tls_dir).await?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut opts = std::fs::OpenOptions::new();
-                    opts.write(true).create(true).truncate(true).mode(0o600);
-                    use std::io::Write;
-                    let mut f = opts.open(&key_file)?;
-                    f.write_all(key_pem.as_bytes())?;
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&tls_dir, std::fs::Permissions::from_mode(0o700));
                 }
-                #[cfg(not(unix))]
-                {
-                    tokio::fs::write(&key_file, &key_pem).await?;
-                }
+                let cert_file = tls_dir.join("cert.pem");
+                let key_file = tls_dir.join("key.pem");
 
-                (cert_pem.into_bytes(), key_pem.into_bytes(), fp)
+                if cert_file.exists() && key_file.exists() {
+                    tracing::info!(
+                        "Reusing existing self-signed TLS credentials in {:?}",
+                        tls_dir
+                    );
+                    let c_bytes = tokio::fs::read(&cert_file).await?;
+                    let k_bytes = Zeroizing::new(tokio::fs::read(&key_file).await?);
+                    let pem_str = String::from_utf8_lossy(&c_bytes);
+                    let fp =
+                        compute_pem_fingerprint(&pem_str).unwrap_or_else(|| "UNKNOWN".to_string());
+                    (c_bytes, k_bytes, fp)
+                } else {
+                    tracing::info!(
+                        "Generating autonomous zero-config self-signed ECDSA TLS certificate (397-day validity)..."
+                    );
+                    let mut sans: Vec<String> = vec![
+                        "localhost".to_string(),
+                        "127.0.0.1".to_string(),
+                        "::1".to_string(),
+                    ];
+                    if let Some(extra_sans) = custom_sans {
+                        for s in extra_sans.split(',') {
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() && !sans.iter().any(|x| x == trimmed) {
+                                sans.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    let (cert_pem, raw_key_pem, fp) = generate_self_signed_tls_cert(&sans)
+                        .map_err(|e| format!("Failed generating self-signed TLS cert: {e}"))?;
+                    let key_pem = Zeroizing::new(raw_key_pem);
+                    tokio::fs::write(&cert_file, &cert_pem).await?;
+
+                    #[cfg(unix)]
+                    {
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true).create(true).truncate(true).mode(0o600);
+                        let mut f = opts.open(&key_file)?;
+                        f.write_all(key_pem.as_bytes())?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        tokio::fs::write(&key_file, key_pem.as_bytes()).await?;
+                    }
+
+                    (
+                        cert_pem.into_bytes(),
+                        Zeroizing::new(key_pem.as_bytes().to_vec()),
+                        fp,
+                    )
+                }
             }
-        }
-    };
+        };
 
     tracing::info!(
         "================================================================================"
     );
-    tracing::info!("TLS 1.3 ACTIVE: Encrypted in transit by default (NIC-to-NIC wire encryption)");
+    tracing::info!("TLS 1.3 STRICT MODE ACTIVE: TLS 1.2 and older handshakes are rejected");
     tracing::info!("Certificate SHA-256 Fingerprint: {}", fp);
     tracing::info!(
         "================================================================================"
     );
 
-    let config = axum_server::tls_rustls::RustlsConfig::from_pem(cert_bytes, key_bytes).await?;
+    let strict_tls13 = build_strict_tls13_server_config(&cert_bytes, key_bytes.as_slice())?;
+    let config = axum_server::tls_rustls::RustlsConfig::from_config(strict_tls13);
     Ok(config)
 }
 
@@ -708,29 +741,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .init();
 
             std::fs::create_dir_all(&data_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700));
+            }
             if lock_process_memory() {
                 tracing::info!(
-                    "Process address space pinned via mlockall(MCL_CURRENT | MCL_FUTURE)."
+                    "Process memory hardened: PR_SET_DUMPABLE=0 and targeted LockedKey mlock() verified."
+                );
+            } else {
+                tracing::warn!(
+                    "mlock() probe failed (missing CAP_IPC_LOCK or insufficient RLIMIT_MEMLOCK). Keys remain ZeroizeOnDrop-protected in RAM; grant cap_add: [IPC_LOCK] for swap pinning."
                 );
             }
             let is_init = is_vault_initialized(&data_dir);
 
             let bootstrap_nonce = if !is_init {
-                let mut nonce_bytes = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut nonce_bytes);
-                let n = format!("init_{}", hex_encode(nonce_bytes));
+                let mut nonce_bytes = Zeroizing::new([0u8; 32]);
+                rand::thread_rng().fill_bytes(nonce_bytes.as_mut());
+                let n = format!("init_{}", hex_encode(nonce_bytes.as_ref()));
+                let nonce_file = data_dir.join(".bootstrap_nonce");
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create(true).truncate(true).mode(0o600);
+                    let mut f = opts.open(&nonce_file)?;
+                    f.write_all(n.as_bytes())?;
+                    f.write_all(b"\n")?;
+                    f.sync_all()?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&nonce_file, format!("{n}\n"))?;
+                }
                 tracing::warn!(
                     "================================================================================"
                 );
                 tracing::warn!(
-                    "VAULT UNINITIALIZED: Use this single-use ephemeral bootstrap nonce to initialize:"
+                    "VAULT UNINITIALIZED: Single-use bootstrap nonce written (0600) to {:?}",
+                    nonce_file
                 );
-                tracing::warn!("Nonce: {}", n);
+                tracing::warn!(
+                    "Retrieve locally (for example: docker exec sovereign-vault cat /data/.bootstrap_nonce)"
+                );
+                tracing::warn!(
+                    "The bootstrap nonce is never printed to container stdout logs and is deleted upon init."
+                );
                 tracing::warn!(
                     "================================================================================"
                 );
                 Some(n)
             } else {
+                let _ = std::fs::remove_file(data_dir.join(".bootstrap_nonce"));
                 tracing::info!("Encrypted SQLCipher vault detected. Starting in SEALED mode.");
                 None
             };
@@ -766,17 +831,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "================================================================================"
                 );
                 let listener = tokio::net::TcpListener::bind(addr).await?;
-                axum::serve(listener, app).await?;
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await?;
             } else {
                 let rustls_config =
                     resolve_tls_config(&data_dir, tls_cert, tls_key, tls_sans).await?;
                 tracing::info!(
-                    "Sovereign Vault v{} listening on https://{} (Native Rustls TLS 1.3)",
+                    "Sovereign Vault v{} listening on https://{} (Native Rustls TLS 1.3 Strict)",
                     env!("CARGO_PKG_VERSION"),
                     bind
                 );
                 axum_server::bind_rustls(addr, rustls_config)
-                    .serve(app.into_make_service())
+                    .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             }
         }
@@ -804,23 +873,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .send()
                 .await?;
             let status = resp.status();
-            let body: serde_json::Value = resp.json().await?;
             if !status.is_success() {
-                eprintln!("Init failed ({status}): {}", body);
+                let err_body: serde_json::Value = resp.json().await?;
+                eprintln!("Init failed ({status}): {}", err_body);
                 std::process::exit(1);
             }
-            println!("{}", serde_json::to_string_pretty(&body)?);
+            let init_resp: InitVaultResponse = resp.json().await?;
+            let formatted = Zeroizing::new(serde_json::to_string_pretty(&init_resp)?);
+            println!("{}", formatted.as_str());
         }
 
         Commands::Unseal { url, stdin } => {
             let base = validate_transport_url(&url)?;
             let key = read_secret_input("Paste 64-hex Unseal Key (hidden): ", stdin)?;
             let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
+            let mut req_body = Zeroizing::new(
+                serde_json::to_vec(&serde_json::json!({ "unseal_key": key.as_str() }))?,
+            );
             let resp = client
                 .post(format!("{base}/v1/sys/unseal"))
-                .json(&serde_json::json!({ "unseal_key": key.as_str() }))
+                .header("content-type", "application/json")
+                .body(req_body.as_slice().to_vec())
                 .send()
                 .await?;
+            req_body.zeroize();
             let status = resp.status();
             let body: serde_json::Value = resp.json().await?;
             if !status.is_success() {
@@ -828,6 +904,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             println!("{}", serde_json::to_string_pretty(&body)?);
+        }
+
+        Commands::RotateUnsealKey {
+            url,
+            key_stdin,
+            token_stdin,
+            token_file,
+        } => {
+            if key_stdin && token_stdin {
+                return Err(
+                    "Cannot pass both --key-stdin and --token-stdin; pass --token-file or VAULT_TOKEN_FILE when piping --key-stdin"
+                        .into(),
+                );
+            }
+            let base = validate_transport_url(&url)?;
+            let tok = resolve_caller_token_with_file(token_stdin, token_file.as_ref())?;
+            let current_key =
+                read_secret_input("Paste Current 64-hex Unseal Key (hidden): ", key_stdin)?;
+            let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
+            let resp = client
+                .post(format!("{base}/v1/sys/rotate-unseal-key"))
+                .header("X-Vault-Token", tok.as_str())
+                .json(&serde_json::json!({ "current_unseal_key": current_key.as_str() }))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let err_body: serde_json::Value = resp.json().await?;
+                eprintln!("Unseal key rotation failed ({status}): {}", err_body);
+                std::process::exit(1);
+            }
+            let rotated: RotateUnsealKeyResponse = resp.json().await?;
+            let formatted = Zeroizing::new(serde_json::to_string_pretty(&rotated)?);
+            println!("{}", formatted.as_str());
         }
 
         Commands::Seal { url, token_stdin } => {
@@ -1004,11 +1114,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::fs::create_dir_all(parent)?;
                 }
             }
-            std::fs::write(&output, dotenv_buf.as_bytes())?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o600))?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                let mut f = opts.open(&output)?;
+                f.write_all(dotenv_buf.as_bytes())?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&output, dotenv_buf.as_bytes())?;
             }
             println!(
                 "Exported {} secret(s) securely (0600) to {:?}",
@@ -1077,21 +1194,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let enrolled: EnrollTokenResponse = resp.json().await?;
                 if let Some(out_path) = output_file {
-                    std::fs::write(&out_path, enrolled.token.as_bytes())?;
                     #[cfg(unix)]
                     {
-                        use std::os::unix::fs::PermissionsExt;
-                        std::fs::set_permissions(
-                            &out_path,
-                            std::fs::Permissions::from_mode(0o600),
-                        )?;
+                        use std::io::Write;
+                        use std::os::unix::fs::OpenOptionsExt;
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true).create(true).truncate(true).mode(0o600);
+                        let mut f = opts.open(&out_path)?;
+                        f.write_all(enrolled.token.as_bytes())?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::write(&out_path, enrolled.token.as_bytes())?;
                     }
                     println!(
                         "Enrolled token '{}' written securely (0600) to {:?}",
                         enrolled.token_id, out_path
                     );
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&enrolled)?);
+                    let formatted = Zeroizing::new(serde_json::to_string_pretty(&enrolled)?);
+                    println!("{}", formatted.as_str());
                 }
             }
 
@@ -1382,10 +1504,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                             let out = Command::new("sh").arg("-c").arg(&key_cmd).output();
                             match out {
-                                Ok(o) if o.status.success() => {
+                                Ok(mut o) if o.status.success() => {
                                     let key_str = Zeroizing::new(
                                         String::from_utf8_lossy(&o.stdout).trim().to_string(),
                                     );
+                                    o.stdout.zeroize();
                                     let unseal_res = client
                                         .post(format!("{base}/v1/sys/unseal"))
                                         .json(

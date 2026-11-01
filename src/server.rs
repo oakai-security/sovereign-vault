@@ -16,27 +16,29 @@ use crate::acl::{
 use crate::crypto::{
     build_secret_aad, constant_time_str_eq, create_envelope, decrypt_secret_with_aad,
     encrypt_secret_with_aad, generate_unseal_key, hex_decode, hex_encode, mint_machine_token,
-    parse_machine_token, unwrap_envelope, verify_token_sha512_ct, LockedKey,
+    parse_machine_token, rotate_envelope_unseal_key, unwrap_envelope, verify_token_sha512_ct,
+    LockedKey, DUMMY_TOKEN_HASH_SHA512_HEX,
 };
 use crate::oidc::{
-    validate_oidc_binding_fields, verify_oidc_jwt_and_resolve, IssuerRefreshReport, OidcBinding,
-    OidcJwksCache, OidcPreset,
+    validate_oidc_binding_fields_with_jwks, verify_oidc_jwt_and_resolve, IssuerRefreshReport,
+    OidcBinding, OidcJwksCache, OidcPreset,
 };
 use crate::storage::{
-    database_path, envelope_path, has_partial_initialization, is_vault_initialized,
-    now_unix_seconds, read_envelope_header, write_envelope_header, AuditLogEntry, BackupMetadata,
-    SecretMetadataItem, Storage, TokenMetadataItem,
+    audit_anchor_path, database_path, envelope_path, has_partial_initialization,
+    is_vault_initialized, now_unix_seconds, read_envelope_header, write_envelope_header,
+    AuditLogEntry, SecretMetadataItem, Storage, TokenMetadataItem,
 };
 use crate::telemetry::SiemForwarder;
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    http::{header::AUTHORIZATION, request::Parts, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +47,29 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const DEFAULT_MAX_AUTH_FAILURES_PER_MINUTE: usize = 15;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_TRACKED_RATE_LIMIT_IPS: usize = 4096;
+
+/// Extracts the TCP peer IP from `ConnectInfo<SocketAddr>` when running over a live socket,
+/// falling back to `0.0.0.0` in in-memory `oneshot` test harnesses.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerIp(pub IpAddr);
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for PeerIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        Ok(PeerIp(ip))
+    }
+}
 
 /// Active unsealed vault state. Exists in RAM strictly while the vault is unsealed;
 /// dropping this struct closes SQLCipher and zeroizes + munlocks `value_aead_key` and `audit_chain_key`.
@@ -63,8 +88,8 @@ pub struct AppState {
     pub oidc_cache: OidcJwksCache,
     pub siem_forwarder: Option<SiemForwarder>,
     pub max_auth_failures_per_window: usize,
-    pub auth_failures: Mutex<VecDeque<Instant>>,
-    pub token_auth_failures: Mutex<VecDeque<Instant>>,
+    pub auth_failures: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    pub token_auth_failures: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
     pub bootstrap_nonce: Mutex<Option<Zeroizing<String>>>,
     pub active: RwLock<Option<VaultActiveState>>,
 }
@@ -96,8 +121,8 @@ impl AppState {
             oidc_cache: OidcJwksCache::new(),
             siem_forwarder: None,
             max_auth_failures_per_window: max_auth_failures_per_window.max(1),
-            auth_failures: Mutex::new(VecDeque::new()),
-            token_auth_failures: Mutex::new(VecDeque::new()),
+            auth_failures: Mutex::new(HashMap::new()),
+            token_auth_failures: Mutex::new(HashMap::new()),
             bootstrap_nonce: Mutex::new(bootstrap_nonce.map(Zeroizing::new)),
             active: RwLock::new(None),
         }
@@ -108,59 +133,84 @@ impl AppState {
         self
     }
 
-    fn check_window(queue: &Mutex<VecDeque<Instant>>, max_failures: usize) -> Result<(), ApiError> {
-        let mut guard = queue
-            .lock()
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Rate limiter lock error"))?;
-        let now = Instant::now();
-        while let Some(&front) = guard.front() {
+    fn prune_queue(q: &mut VecDeque<Instant>, now: Instant) {
+        while let Some(&front) = q.front() {
             if now.duration_since(front) >= RATE_LIMIT_WINDOW {
-                guard.pop_front();
+                q.pop_front();
             } else {
                 break;
             }
         }
-        if guard.len() >= max_failures {
-            tracing::warn!(
-                failures_in_window = guard.len(),
-                "Rate limit exceeded on authentication / unseal window"
-            );
-            return Err(api_err(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Too many failed authentication or unseal attempts; retry after 60 seconds",
-            ));
+    }
+
+    fn check_window(
+        buckets: &Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+        peer_ip: IpAddr,
+        max_failures: usize,
+    ) -> Result<(), ApiError> {
+        let mut guard = buckets
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Rate limiter lock error"))?;
+        let now = Instant::now();
+        if let Some(q) = guard.get_mut(&peer_ip) {
+            Self::prune_queue(q, now);
+            if q.len() >= max_failures {
+                tracing::warn!(
+                    peer_ip = %peer_ip,
+                    failures_in_window = q.len(),
+                    "Per-IP rate limit exceeded on authentication / unseal window"
+                );
+                return Err(api_err(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many failed authentication or unseal attempts; retry after 60 seconds",
+                ));
+            }
         }
         Ok(())
     }
 
-    fn record_in_window(queue: &Mutex<VecDeque<Instant>>) {
-        if let Ok(mut guard) = queue.lock() {
+    fn record_in_window(buckets: &Mutex<HashMap<IpAddr, VecDeque<Instant>>>, peer_ip: IpAddr) {
+        if let Ok(mut guard) = buckets.lock() {
             let now = Instant::now();
-            while let Some(&front) = guard.front() {
-                if now.duration_since(front) >= RATE_LIMIT_WINDOW {
-                    guard.pop_front();
-                } else {
-                    break;
+            if guard.len() >= MAX_TRACKED_RATE_LIMIT_IPS && !guard.contains_key(&peer_ip) {
+                guard.retain(|_, q| {
+                    Self::prune_queue(q, now);
+                    !q.is_empty()
+                });
+                if guard.len() >= MAX_TRACKED_RATE_LIMIT_IPS {
+                    if let Some(&arbitrary_ip) = guard.keys().next() {
+                        guard.remove(&arbitrary_ip);
+                    }
                 }
             }
-            guard.push_back(now);
+            let q = guard.entry(peer_ip).or_default();
+            Self::prune_queue(q, now);
+            q.push_back(now);
         }
     }
 
-    fn check_rate_limit(&self) -> Result<(), ApiError> {
-        Self::check_window(&self.auth_failures, self.max_auth_failures_per_window)
+    fn check_rate_limit_ip(&self, peer_ip: IpAddr) -> Result<(), ApiError> {
+        Self::check_window(
+            &self.auth_failures,
+            peer_ip,
+            self.max_auth_failures_per_window,
+        )
     }
 
-    fn record_auth_failure(&self) {
-        Self::record_in_window(&self.auth_failures);
+    fn record_auth_failure_ip(&self, peer_ip: IpAddr) {
+        Self::record_in_window(&self.auth_failures, peer_ip);
     }
 
-    fn check_token_rate_limit(&self) -> Result<(), ApiError> {
-        Self::check_window(&self.token_auth_failures, self.max_auth_failures_per_window)
+    fn check_token_rate_limit_ip(&self, peer_ip: IpAddr) -> Result<(), ApiError> {
+        Self::check_window(
+            &self.token_auth_failures,
+            peer_ip,
+            self.max_auth_failures_per_window,
+        )
     }
 
-    fn record_token_auth_failure(&self) {
-        Self::record_in_window(&self.token_auth_failures);
+    fn record_token_auth_failure_ip(&self, peer_ip: IpAddr) {
+        Self::record_in_window(&self.token_auth_failures, peer_ip);
     }
 }
 
@@ -177,6 +227,32 @@ pub struct HealthResponse {
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct UnsealRequest {
     pub unseal_key: String,
+}
+
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct InitVaultResponse {
+    #[zeroize(skip)]
+    pub status: String,
+    pub unseal_key: String,
+    #[zeroize(skip)]
+    pub admin_token_id: String,
+    pub admin_token: String,
+    #[zeroize(skip)]
+    pub warning: String,
+}
+
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct RotateUnsealKeyRequest {
+    pub current_unseal_key: String,
+}
+
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+pub struct RotateUnsealKeyResponse {
+    #[zeroize(skip)]
+    pub status: String,
+    pub new_unseal_key: String,
+    #[zeroize(skip)]
+    pub warning: String,
 }
 
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
@@ -326,6 +402,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/v1/sys/metrics", get(metrics_handler))
         .route("/v1/sys/init", post(init_handler))
         .route("/v1/sys/unseal", post(unseal_handler))
+        .route("/v1/sys/rotate-unseal-key", post(rotate_unseal_key_handler))
         .route("/v1/sys/seal", post(seal_handler))
         .route("/v1/sys/backup", post(backup_handler))
         .route("/v1/sys/audit", get(audit_log_handler))
@@ -380,6 +457,40 @@ fn record_audit(
     }
 }
 
+/// Fail-closed audit helper: returns `500 Internal Server Error` if the audit chain entry
+/// or external `vault.audit_anchor` cannot be durably written before returning sensitive data.
+fn record_audit_strict(
+    active: &VaultActiveState,
+    event_type: &str,
+    actor: &str,
+    resource: &str,
+    outcome: &str,
+) -> Result<(), ApiError> {
+    let entry = {
+        let mut db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
+        db.append_audit_event(
+            &active.audit_chain_key,
+            event_type,
+            actor,
+            resource,
+            outcome,
+        )
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist mandatory audit event",
+            )
+        })?
+    };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
+    }
+    Ok(())
+}
+
 /// Extract raw bearer token strictly from `X-Vault-Token` or `Authorization: Bearer ...`.
 /// Default-deny: missing or malformed headers ALWAYS fail with `401 Unauthorized`.
 fn extract_raw_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -422,20 +533,21 @@ fn extract_raw_token(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 /// Dual-Mode Authentication:
 /// 1. If the bearer credential is a 3-segment RFC 7519 JWT (`header.payload.signature`),
-///    verify its cryptographic signature against the in-memory OIDC JWKS cache and evaluate
+///    verify its cryptographic signature against the per-binding OIDC JWKS cache and evaluate
 ///    SQLCipher `oidc_bindings` claim rules.
 /// 2. Otherwise, authenticate as a `sv_live_*` / `sv_admin_*` machine token against SQLCipher
-///    using SHA-512 constant-time verification.
+///    using SHA-512 constant-time verification (with dummy hash equalization on unknown IDs).
 fn authenticate_caller(
     state: &AppState,
     active: &VaultActiveState,
     headers: &HeaderMap,
+    peer_ip: IpAddr,
 ) -> Result<ScopedToken, ApiError> {
     let raw_tok = match extract_raw_token(headers) {
         Ok(t) => t,
         Err(e) => {
-            state.check_token_rate_limit()?;
-            state.record_token_auth_failure();
+            state.check_token_rate_limit_ip(peer_ip)?;
+            state.record_token_auth_failure_ip(peer_ip);
             return Err(e);
         }
     };
@@ -471,8 +583,8 @@ fn authenticate_caller(
                 return Ok(scoped_tok);
             }
             Err(oidc_err) => {
-                state.check_token_rate_limit()?;
-                state.record_token_auth_failure();
+                state.check_token_rate_limit_ip(peer_ip)?;
+                state.record_token_auth_failure_ip(peer_ip);
                 let err_msg = oidc_err.to_string();
                 record_audit(
                     active,
@@ -493,8 +605,8 @@ fn authenticate_caller(
     let (token_id, candidate_secret) = match parse_machine_token(raw_tok) {
         Ok(parsed) => parsed,
         Err(_) => {
-            state.check_token_rate_limit()?;
-            state.record_token_auth_failure();
+            state.check_token_rate_limit_ip(peer_ip)?;
+            state.record_token_auth_failure_ip(peer_ip);
             return Err(api_err(
                 StatusCode::UNAUTHORIZED,
                 "Invalid machine token or OIDC JWT format",
@@ -514,8 +626,10 @@ fn authenticate_caller(
     let tok = match stored_tok {
         Some(t) => t,
         None => {
-            state.check_token_rate_limit()?;
-            state.record_token_auth_failure();
+            // Equalize SHA-512 + constant-time comparison work when token_id does not exist
+            let _ = verify_token_sha512_ct(&candidate_secret, DUMMY_TOKEN_HASH_SHA512_HEX);
+            state.check_token_rate_limit_ip(peer_ip)?;
+            state.record_token_auth_failure_ip(peer_ip);
             record_audit(
                 active,
                 "auth.failed",
@@ -531,8 +645,8 @@ fn authenticate_caller(
     };
 
     if !verify_token_sha512_ct(&candidate_secret, &tok.token_hash_sha512) {
-        state.check_token_rate_limit()?;
-        state.record_token_auth_failure();
+        state.check_token_rate_limit_ip(peer_ip)?;
+        state.record_token_auth_failure_ip(peer_ip);
         record_audit(active, "auth.failed", &token_id, "sys/auth", "bad_secret");
         return Err(api_err(StatusCode::UNAUTHORIZED, "Invalid machine token"));
     }
@@ -540,8 +654,8 @@ fn authenticate_caller(
     let now = now_unix_seconds();
     if let Some(exp) = tok.expires_at {
         if now >= exp {
-            state.check_token_rate_limit()?;
-            state.record_token_auth_failure();
+            state.check_token_rate_limit_ip(peer_ip)?;
+            state.record_token_auth_failure_ip(peer_ip);
             record_audit(active, "auth.failed", &token_id, "sys/auth", "expired");
             return Err(api_err(
                 StatusCode::UNAUTHORIZED,
@@ -582,15 +696,16 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
 async fn init_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.check_rate_limit()?;
+    state.check_rate_limit_ip(peer_ip)?;
 
     let supplied_nonce = headers
         .get("X-Vault-Bootstrap-Nonce")
         .and_then(|h| h.to_str().ok())
         .ok_or_else(|| {
-            state.record_auth_failure();
+            state.record_auth_failure_ip(peer_ip);
             api_err(StatusCode::FORBIDDEN, "Missing bootstrap nonce")
         })?;
 
@@ -614,15 +729,15 @@ async fn init_handler(
         .lock()
         .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Bootstrap lock error"))?;
     let expected = nonce_guard.as_ref().ok_or_else(|| {
-        state.record_auth_failure();
+        state.record_auth_failure_ip(peer_ip);
         api_err(
             StatusCode::FORBIDDEN,
             "Bootstrap nonce already consumed or unavailable",
         )
     })?;
     if !constant_time_str_eq(supplied_nonce, expected.as_str()) {
-        state.record_auth_failure();
-        tracing::warn!("Rejected /v1/sys/init with invalid bootstrap nonce");
+        state.record_auth_failure_ip(peer_ip);
+        tracing::warn!(peer_ip = %peer_ip, "Rejected /v1/sys/init with invalid bootstrap nonce");
         return Err(api_err(StatusCode::FORBIDDEN, "Invalid bootstrap nonce"));
     }
 
@@ -653,6 +768,13 @@ async fn init_handler(
         "write".to_string(),
         "delete".to_string(),
     ];
+    let init_audit = storage.append_audit_event(
+        &audit_chain_key,
+        "sys.init",
+        &admin_token_id,
+        "sys/vault",
+        "initialized",
+    );
     if storage
         .put_token(
             &admin_token_id,
@@ -664,29 +786,27 @@ async fn init_handler(
             None,
         )
         .is_err()
-        || storage
-            .append_audit_event(
-                &audit_chain_key,
-                "sys.init",
-                &admin_token_id,
-                "sys/vault",
-                "initialized",
-            )
-            .is_err()
+        || init_audit.is_err()
         || write_envelope_header(&state.data_dir, &envelope_hdr).is_err()
     {
         drop(storage);
         let _ = std::fs::remove_file(database_path(&state.data_dir));
         let _ = std::fs::remove_file(envelope_path(&state.data_dir));
+        let _ = std::fs::remove_file(audit_anchor_path(&state.data_dir));
         return Err(api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to persist initial vault state",
         ));
     }
 
+    if let (Ok(entry), Some(ref forwarder)) = (init_audit, &state.siem_forwarder) {
+        forwarder.emit(entry);
+    }
+
     // Burn nonce strictly AFTER both SQLCipher DB and envelope header are durably persisted (`FM-06`)
     *nonce_guard = None;
     drop(nonce_guard);
+    let _ = std::fs::remove_file(state.data_dir.join(".bootstrap_nonce"));
 
     let unseal_key_hex = Zeroizing::new(hex_encode(unseal_key.as_ref()));
 
@@ -703,20 +823,21 @@ async fn init_handler(
         "Vault initialized with SQLCipher + HKDF-SHA512 envelope and unsealed."
     );
 
-    Ok(Json(serde_json::json!({
-        "status": "initialized",
-        "unseal_key": unseal_key_hex.as_str(),
-        "admin_token_id": admin_token_id,
-        "admin_token": raw_admin_token.as_str(),
-        "warning": "Store both unseal_key and admin_token in Ubuntu Secret Service (keyring) or 1Password immediately. Neither is ever stored in plaintext or displayed again."
-    })))
+    Ok(Json(InitVaultResponse {
+        status: "initialized".to_string(),
+        unseal_key: unseal_key_hex.as_str().to_string(),
+        admin_token_id,
+        admin_token: raw_admin_token.as_str().to_string(),
+        warning: "Store both unseal_key and admin_token in Ubuntu Secret Service (keyring) or 1Password immediately. Neither is ever stored in plaintext or displayed again.".to_string(),
+    }))
 }
 
 async fn unseal_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     Json(payload): Json<UnsealRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.check_rate_limit()?;
+    state.check_rate_limit_ip(peer_ip)?;
 
     if !is_vault_initialized(&state.data_dir) {
         return Err(api_err(
@@ -731,11 +852,11 @@ async fn unseal_handler(
     }
 
     let decoded = Zeroizing::new(hex_decode(payload.unseal_key.trim()).map_err(|_| {
-        state.record_auth_failure();
+        state.record_auth_failure_ip(peer_ip);
         api_err(StatusCode::BAD_REQUEST, "Invalid hex-encoded unseal key")
     })?);
     if decoded.len() != 32 {
-        state.record_auth_failure();
+        state.record_auth_failure_ip(peer_ip);
         return Err(api_err(
             StatusCode::BAD_REQUEST,
             "Unseal key must be exactly 32 bytes (64 hex characters)",
@@ -755,8 +876,11 @@ async fn unseal_handler(
     // Cryptographically verify AEAD tag on wrapped DEK BEFORE opening DB or touching state!
     let (db_key, value_aead_key, audit_chain_key) =
         unwrap_envelope(&key_arr, &header).map_err(|_| {
-            state.record_auth_failure();
-            tracing::warn!("Rejected /v1/sys/unseal: AEAD verification failed for supplied key");
+            state.record_auth_failure_ip(peer_ip);
+            tracing::warn!(
+                peer_ip = %peer_ip,
+                "Rejected /v1/sys/unseal: AEAD verification failed for supplied key"
+            );
             api_err(StatusCode::UNAUTHORIZED, "Invalid unseal key")
         })?;
 
@@ -774,16 +898,22 @@ async fn unseal_handler(
         )
     })?;
     let existing_bindings = storage.list_oidc_bindings().unwrap_or_default();
-    if let Ok(entry) = storage.append_audit_event(
-        &audit_chain_key,
-        "sys.unseal",
-        "unseal-operator",
-        "sys/vault",
-        "unsealed",
-    ) {
-        if let Some(ref forwarder) = state.siem_forwarder {
-            forwarder.emit(entry);
-        }
+    let unseal_entry = storage
+        .append_audit_event(
+            &audit_chain_key,
+            "sys.unseal",
+            "unseal-operator",
+            "sys/vault",
+            "unsealed",
+        )
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to persist unseal audit event",
+            )
+        })?;
+    if let Some(ref forwarder) = state.siem_forwarder {
+        forwarder.emit(unseal_entry);
     }
 
     *active_guard = Some(VaultActiveState {
@@ -807,8 +937,109 @@ async fn unseal_handler(
     })))
 }
 
+async fn rotate_unseal_key_handler(
+    State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
+    headers: HeaderMap,
+    Json(payload): Json<RotateUnsealKeyRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    state.check_rate_limit_ip(peer_ip)?;
+
+    let active_guard = state.active.write().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
+
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
+    if !caller.is_admin(now_unix_seconds()) {
+        record_audit(
+            active,
+            "acl.denied",
+            &caller.token_id,
+            "sys/rotate-unseal-key",
+            "forbidden",
+        );
+        return Err(api_err(
+            StatusCode::FORBIDDEN,
+            "Admin capability required to rotate master unseal key",
+        ));
+    }
+
+    let decoded =
+        Zeroizing::new(
+            hex_decode(payload.current_unseal_key.trim()).map_err(|_| {
+                state.record_auth_failure_ip(peer_ip);
+                api_err(StatusCode::BAD_REQUEST, "Invalid hex-encoded current_unseal_key")
+            })?,
+        );
+    if decoded.len() != 32 {
+        state.record_auth_failure_ip(peer_ip);
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "current_unseal_key must be exactly 32 bytes (64 hex characters)",
+        ));
+    }
+
+    let mut cur_key_arr = Zeroizing::new([0u8; 32]);
+    cur_key_arr.copy_from_slice(&decoded);
+
+    let current_header = read_envelope_header(&state.data_dir).map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to read vault envelope",
+        )
+    })?;
+
+    let (new_unseal_key, new_header) =
+        rotate_envelope_unseal_key(&cur_key_arr, &current_header).map_err(|_| {
+            state.record_auth_failure_ip(peer_ip);
+            record_audit(
+                active,
+                "sys.rotate_unseal_key.failed",
+                &caller.token_id,
+                "sys/envelope",
+                "invalid_unseal_key",
+            );
+            api_err(
+                StatusCode::UNAUTHORIZED,
+                "Current unseal key verification failed",
+            )
+        })?;
+
+    write_envelope_header(&state.data_dir, &new_header).map_err(|_| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to atomically persist rotated vault envelope",
+        )
+    })?;
+
+    if let Err(e) = record_audit_strict(
+        active,
+        "sys.rotate_unseal_key",
+        &caller.token_id,
+        "sys/envelope",
+        "rotated",
+    ) {
+        let _ = write_envelope_header(&state.data_dir, &current_header);
+        return Err(e);
+    }
+
+    let new_unseal_hex = Zeroizing::new(hex_encode(new_unseal_key.as_ref()));
+    tracing::info!(
+        admin_token_id = %caller.token_id,
+        "Rotated master unseal key (KEK) on vault.envelope without re-keying DEK."
+    );
+
+    Ok(Json(RotateUnsealKeyResponse {
+        status: "rotated".to_string(),
+        new_unseal_key: new_unseal_hex.as_str().to_string(),
+        warning: "Update your OS Secret Service (keyring) or KMS envelope immediately. The previous unseal key is permanently invalidated.".to_string(),
+    }))
+}
+
 async fn metrics_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Query(query): Query<MetricsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -817,7 +1048,7 @@ async fn metrics_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -860,7 +1091,7 @@ async fn metrics_handler(
             "# HELP vault_sealed Whether Sovereign Vault is currently sealed (0=active, 1=sealed)\n\
              # TYPE vault_sealed gauge\n\
              vault_sealed 0\n\
-             # HELP vault_memory_locked Whether mlockall/mlock RAM pinning is active (1=locked)\n\
+             # HELP vault_memory_locked Whether mlock RAM pinning is active (1=locked)\n\
              # TYPE vault_memory_locked gauge\n\
              vault_memory_locked {}\n\
              # HELP vault_uptime_seconds Process uptime in seconds\n\
@@ -922,6 +1153,7 @@ async fn metrics_handler(
 
 async fn enroll_oidc_binding_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Json(payload): Json<EnrollOidcBindingRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -930,7 +1162,7 @@ async fn enroll_oidc_binding_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
     if !caller.is_admin(now) {
         record_audit(
@@ -990,14 +1222,16 @@ async fn enroll_oidc_binding_handler(
         clean_name,
         clean_project,
         clean_issuer,
+        clean_jwks_uri,
         clean_aud,
         clean_claim,
         clean_pattern,
         clean_paths,
-    ) = validate_oidc_binding_fields(
+    ) = validate_oidc_binding_fields_with_jwks(
         &payload.name,
         &payload.project,
         resolved_issuer,
+        &resolved_jwks_uri,
         resolved_aud,
         resolved_claim,
         &payload.subject_pattern,
@@ -1033,7 +1267,7 @@ async fn enroll_oidc_binding_handler(
         project: clean_project,
         issuer: clean_issuer,
         audience: clean_aud,
-        jwks_uri: resolved_jwks_uri,
+        jwks_uri: clean_jwks_uri,
         subject_claim: clean_claim,
         subject_pattern: clean_pattern,
         allowed_paths: clean_paths,
@@ -1042,30 +1276,25 @@ async fn enroll_oidc_binding_handler(
         created_at: now,
     };
 
-    let all_bindings = {
+    let (entry, all_bindings) = {
         let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.put_oidc_binding(&binding).map_err(|_| {
-            api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist OIDC binding",
-            )
-        })?;
-        if let Ok(entry) = db.append_audit_event(
-            &active.audit_chain_key,
-            "oidc.binding.enroll",
-            &caller.token_id,
-            &binding_id,
-            "created",
-        ) {
-            if let Some(ref forwarder) = active.siem_forwarder {
-                forwarder.emit(entry);
-            }
-        }
-        db.list_oidc_bindings().unwrap_or_default()
+        let audit_entry = db
+            .put_oidc_binding_audited(&binding, &active.audit_chain_key, &caller.token_id)
+            .map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to persist OIDC binding and audit record",
+                )
+            })?;
+        let all = db.list_oidc_bindings().unwrap_or_default();
+        (audit_entry, all)
     };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
+    }
 
     // Automatically refresh in-memory JWKS cache immediately when an admin adds/updates a provider!
     let jwks_refresh = state.oidc_cache.refresh_bindings(&all_bindings).await;
@@ -1083,6 +1312,7 @@ async fn enroll_oidc_binding_handler(
 
 async fn list_oidc_bindings_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let active_guard = state.active.read().await;
@@ -1090,7 +1320,7 @@ async fn list_oidc_bindings_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1126,6 +1356,7 @@ async fn list_oidc_bindings_handler(
 
 async fn revoke_oidc_binding_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Path(target_binding_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1134,7 +1365,7 @@ async fn revoke_oidc_binding_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1149,36 +1380,33 @@ async fn revoke_oidc_binding_handler(
         ));
     }
 
-    let (existed, remaining) = {
+    let (maybe_entry, remaining) = {
         let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        let ok = db.delete_oidc_binding(&target_binding_id).map_err(|_| {
-            api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "OIDC binding deletion failed",
-            )
-        })?;
-        if ok {
-            if let Ok(entry) = db.append_audit_event(
-                &active.audit_chain_key,
-                "oidc.binding.revoke",
-                &caller.token_id,
+        let deleted_entry = db
+            .delete_oidc_binding_audited(
                 &target_binding_id,
-                "revoked",
-            ) {
-                if let Some(ref forwarder) = active.siem_forwarder {
-                    forwarder.emit(entry);
-                }
-            }
-        }
+                &active.audit_chain_key,
+                &caller.token_id,
+            )
+            .map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "OIDC binding deletion or audit persistence failed",
+                )
+            })?;
         let rem = db.list_oidc_bindings().unwrap_or_default();
-        (ok, rem)
+        (deleted_entry, rem)
     };
 
-    if !existed {
+    let Some(entry) = maybe_entry else {
         return Err(api_err(StatusCode::NOT_FOUND, "OIDC binding ID not found"));
+    };
+
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
     }
 
     let _ = state.oidc_cache.refresh_bindings(&remaining).await;
@@ -1187,6 +1415,7 @@ async fn revoke_oidc_binding_handler(
 
 async fn refresh_oidc_jwks_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let active_guard = state.active.read().await;
@@ -1194,7 +1423,7 @@ async fn refresh_oidc_jwks_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1224,13 +1453,13 @@ async fn refresh_oidc_jwks_handler(
 
     let refreshed_issuers = state.oidc_cache.refresh_bindings(&bindings).await;
     let total_cached_keys = state.oidc_cache.total_cached_keys();
-    record_audit(
+    record_audit_strict(
         active,
         "oidc.jwks.refresh",
         &caller.token_id,
         "sys/oidc/refresh",
         "ok",
-    );
+    )?;
 
     Ok(Json(RefreshOidcResponse {
         refreshed_issuers,
@@ -1240,6 +1469,7 @@ async fn refresh_oidc_jwks_handler(
 
 async fn seal_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let mut active_guard = state.active.write().await;
@@ -1247,7 +1477,7 @@ async fn seal_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is already sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1263,8 +1493,11 @@ async fn seal_handler(
     }
 
     let caller_id = caller.token_id.clone();
-    record_audit(active, "sys.seal", &caller_id, "sys/vault", "sealed");
+    record_audit_strict(active, "sys.seal", &caller_id, "sys/vault", "sealed")?;
     *active_guard = None;
+    drop(active_guard);
+
+    let _ = state.oidc_cache.refresh_bindings(&[]).await;
 
     tracing::warn!(token_id = %caller_id, "Vault sealed via administrative request; RAM keys zeroized and unlocked.");
     Ok(Json(serde_json::json!({
@@ -1275,6 +1508,7 @@ async fn seal_handler(
 
 async fn backup_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let active_guard = state.active.read().await;
@@ -1282,7 +1516,7 @@ async fn backup_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1297,7 +1531,7 @@ async fn backup_handler(
         ));
     }
 
-    let meta: BackupMetadata = {
+    let (meta, entry) = {
         let mut db = active
             .storage
             .lock()
@@ -1305,20 +1539,31 @@ async fn backup_handler(
         let m = db
             .create_encrypted_backup()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encrypted backup failed"))?;
-        let _ = db.append_audit_event(
-            &active.audit_chain_key,
-            "sys.backup",
-            &caller.token_id,
-            &m.snapshot_id,
-            "created",
-        );
-        m
+        let audit_entry = db
+            .append_audit_event(
+                &active.audit_chain_key,
+                "sys.backup",
+                &caller.token_id,
+                &m.snapshot_id,
+                "created",
+            )
+            .map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to persist backup audit event",
+                )
+            })?;
+        (m, audit_entry)
     };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
+    }
 
     tracing::info!(
         admin_token_id = %caller.token_id,
         snapshot_id = %meta.snapshot_id,
         bytes = meta.total_bytes,
+        sha256 = %meta.sha256,
         "Created online encrypted SQLCipher snapshot"
     );
 
@@ -1327,6 +1572,7 @@ async fn backup_handler(
 
 async fn audit_log_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1335,7 +1581,7 @@ async fn audit_log_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1369,6 +1615,7 @@ async fn audit_log_handler(
 
 async fn list_tokens_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     let active_guard = state.active.read().await;
@@ -1376,7 +1623,7 @@ async fn list_tokens_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1405,6 +1652,7 @@ async fn list_tokens_handler(
 
 async fn list_secrets_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Query(query): Query<ListSecretsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1413,7 +1661,7 @@ async fn list_secrets_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
 
     let canonical_prefix = match query.prefix.as_deref() {
@@ -1455,6 +1703,7 @@ async fn list_secrets_handler(
 
 async fn enroll_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Json(payload): Json<EnrollTokenRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1463,7 +1712,7 @@ async fn enroll_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
     if !caller.is_admin(now) {
         record_audit(
@@ -1507,12 +1756,12 @@ async fn enroll_handler(
 
     let (token_id, raw_token, token_hash_sha512) = mint_machine_token();
 
-    {
+    let audit_entry = {
         let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.put_token(
+        db.put_token_audited(
             &token_id,
             &token_hash_sha512,
             &valid_project,
@@ -1520,21 +1769,18 @@ async fn enroll_handler(
             &validated_paths,
             &payload.capabilities,
             expires_at,
-        )
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to persist token"))?;
-        db.append_audit_event(
             &active.audit_chain_key,
-            "token.enroll",
             &caller.token_id,
-            &token_id,
-            "created",
         )
         .map_err(|_| {
             api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist audit event",
+                "Failed to persist token and audit event",
             )
-        })?;
+        })?
+    };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(audit_entry);
     }
 
     tracing::info!(
@@ -1561,6 +1807,7 @@ async fn enroll_handler(
 
 async fn revoke_token_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Path(target_token_id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1569,7 +1816,7 @@ async fn revoke_token_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     if !caller.is_admin(now_unix_seconds()) {
         record_audit(
             active,
@@ -1584,34 +1831,30 @@ async fn revoke_token_handler(
         ));
     }
 
-    let existed = {
+    let maybe_entry = {
         let mut db = active
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        let ok = db
-            .delete_token(&target_token_id)
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Token deletion failed"))?;
-        if ok {
-            db.append_audit_event(
-                &active.audit_chain_key,
-                "token.revoke",
-                &caller.token_id,
-                &target_token_id,
-                "revoked",
+        db.delete_token_audited(
+            &target_token_id,
+            &active.audit_chain_key,
+            &caller.token_id,
+        )
+        .map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Token deletion or audit persistence failed",
             )
-            .map_err(|_| {
-                api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to persist audit event",
-                )
-            })?;
-        }
-        ok
+        })?
     };
 
-    if !existed {
+    let Some(entry) = maybe_entry else {
         return Err(api_err(StatusCode::NOT_FOUND, "Token ID not found"));
+    };
+
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
     }
 
     tracing::info!(
@@ -1625,6 +1868,7 @@ async fn revoke_token_handler(
 
 async fn get_secret_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Path(raw_path): Path<String>,
     Query(query): Query<GetSecretQuery>,
@@ -1637,7 +1881,7 @@ async fn get_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
     if !caller.is_path_allowed(&canon_path, "read", now) {
         record_audit(
@@ -1702,23 +1946,27 @@ async fn get_secret_handler(
                 )
             })?;
 
-    let val = std::str::from_utf8(plaintext.as_slice())
-        .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Corrupt UTF-8 secret"))?
-        .to_string();
+    let val = Zeroizing::new(
+        std::str::from_utf8(plaintext.as_slice())
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Corrupt UTF-8 secret"))?
+            .to_string(),
+    );
 
-    record_audit(active, "secret.get", &caller.token_id, &canon_path, "ok");
+    // Fail-closed audit record BEFORE returning plaintext secret (`SV-10`)
+    record_audit_strict(active, "secret.get", &caller.token_id, &canon_path, "ok")?;
     tracing::info!(token_id = %caller.token_id, path = %canon_path, version = rec.version, "Secret read");
 
     Ok(Json(SecretResponse {
         path: canon_path,
         project: rec.project,
         version: rec.version,
-        value: val,
+        value: val.as_str().to_string(),
     }))
 }
 
 async fn put_secret_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Path(raw_path): Path<String>,
     Json(payload): Json<PutSecretRequest>,
@@ -1733,7 +1981,7 @@ async fn put_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
     if !caller.is_path_allowed(&canon_path, "write", now) {
         record_audit(
@@ -1768,7 +2016,7 @@ async fn put_secret_handler(
         ));
     }
 
-    let version = {
+    let (version, entry) = {
         let mut db = active
             .storage
             .lock()
@@ -1781,13 +2029,17 @@ async fn put_secret_handler(
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret lookup failed"))?
         {
             if !caller.is_admin(now) && existing.project != project {
-                let _ = db.append_audit_event(
+                if let Ok(denial) = db.append_audit_event(
                     &active.audit_chain_key,
                     "acl.denied",
                     &caller.token_id,
                     &canon_path,
                     "project_mismatch",
-                );
+                ) {
+                    if let Some(ref forwarder) = active.siem_forwarder {
+                        forwarder.emit(denial);
+                    }
+                }
                 return Err(api_err(
                     StatusCode::FORBIDDEN,
                     "Access forbidden: secret path is already owned by another project",
@@ -1802,23 +2054,27 @@ async fn put_secret_handler(
         let (ct, nonce) =
             encrypt_secret_with_aad(&active.value_aead_key, payload.value.as_bytes(), &aad)
                 .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encryption failed"))?;
-        db.put_secret_versioned(&canon_path, &project, next_ver, &ct, &nonce)
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Persistence failed"))?;
-        db.append_audit_event(
-            &active.audit_chain_key,
-            "secret.put",
-            &caller.token_id,
-            &canon_path,
-            &format!("v{next_ver}"),
-        )
-        .map_err(|_| {
-            api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to persist audit event",
+        let audit_entry = db
+            .put_secret_versioned_audited(
+                &canon_path,
+                &project,
+                next_ver,
+                &ct,
+                &nonce,
+                &active.audit_chain_key,
+                &caller.token_id,
             )
-        })?;
-        next_ver
+            .map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Secret or audit persistence failed",
+                )
+            })?;
+        (next_ver, audit_entry)
     };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
+    }
 
     tracing::info!(
         token_id = %caller.token_id,
@@ -1837,6 +2093,7 @@ async fn put_secret_handler(
 
 async fn delete_secret_handler(
     State(state): State<Arc<AppState>>,
+    PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
     Path(raw_path): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1848,7 +2105,7 @@ async fn delete_secret_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers)?;
+    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
     let now = now_unix_seconds();
     if !caller.is_path_allowed(&canon_path, "delete", now) {
         record_audit(
@@ -1864,7 +2121,7 @@ async fn delete_secret_handler(
         ));
     }
 
-    let deleted = {
+    let maybe_entry = {
         let mut db = active
             .storage
             .lock()
@@ -1876,13 +2133,17 @@ async fn delete_secret_handler(
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret lookup failed"))?
         {
             if !caller.is_admin(now) && caller.project != existing.project {
-                let _ = db.append_audit_event(
+                if let Ok(denial) = db.append_audit_event(
                     &active.audit_chain_key,
                     "acl.denied",
                     &caller.token_id,
                     &canon_path,
                     "project_mismatch",
-                );
+                ) {
+                    if let Some(ref forwarder) = active.siem_forwarder {
+                        forwarder.emit(denial);
+                    }
+                }
                 return Err(api_err(
                     StatusCode::FORBIDDEN,
                     "Access forbidden: project mismatch on delete",
@@ -1892,29 +2153,21 @@ async fn delete_secret_handler(
             return Err(api_err(StatusCode::NOT_FOUND, "Secret path not found"));
         }
 
-        let ok = db
-            .delete_secret(&canon_path)
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Secret deletion failed"))?;
-        if ok {
-            db.append_audit_event(
-                &active.audit_chain_key,
-                "secret.delete",
-                &caller.token_id,
-                &canon_path,
-                "deleted",
-            )
+        db.delete_secret_audited(&canon_path, &active.audit_chain_key, &caller.token_id)
             .map_err(|_| {
                 api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to persist audit event",
+                    "Secret deletion or audit persistence failed",
                 )
-            })?;
-        }
-        ok
+            })?
     };
 
-    if !deleted {
+    let Some(entry) = maybe_entry else {
         return Err(api_err(StatusCode::NOT_FOUND, "Secret path not found"));
+    };
+
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
     }
 
     tracing::info!(token_id = %caller.token_id, path = %canon_path, "Secret deleted");

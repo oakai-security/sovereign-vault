@@ -1,5 +1,6 @@
 //! Cryptographic primitives: mmap/mlock RAM-pinned keys, HKDF-SHA512 envelope wrapping,
-//! AES-256-GCM AEAD with Associated Data (AAD), and SHA-512 constant-time token hashing.
+//! KEK unseal-key rotation, AES-256-GCM AEAD with Associated Data (AAD), strict TLS 1.3
+//! server configuration, and SHA-512 constant-time token hashing.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
@@ -9,6 +10,8 @@ use hkdf::Hkdf;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -18,6 +21,10 @@ const KEK_INFO: &[u8] = b"sovereign-vault:v2:kek";
 const SQLCIPHER_KEY_INFO: &[u8] = b"sovereign-vault:v2:sqlcipher-db-key";
 const VALUE_AEAD_KEY_INFO: &[u8] = b"sovereign-vault:v2:value-aead-key";
 const AUDIT_CHAIN_KEY_INFO: &[u8] = b"sovereign-vault:v2:audit-chain-key";
+
+/// Precomputed SHA-512 hex digest of `[0u8; 32]` used to equalize work when a `token_id` lookup misses.
+pub const DUMMY_TOKEN_HASH_SHA512_HEX: &str =
+    "50f685a26f7141114585c01332262597101f9860d233c703237d8c22923c4a269a0d23f35852f71c80f875e2b0d84b170565c121318a93f94f0b7f980d612432";
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -107,7 +114,7 @@ impl LockedKey {
             let is_mlocked = libc::mlock(map_ptr, alloc_len) == 0;
             if !is_mlocked {
                 tracing::warn!(
-                    "mlock() returned non-zero (check container ulimits.memlock); zeroize-on-drop remains active"
+                    "mlock() returned non-zero (grant CAP_IPC_LOCK and check ulimits.memlock); zeroize-on-drop remains active"
                 );
             }
 
@@ -177,16 +184,13 @@ pub fn generate_unseal_key() -> Zeroizing<[u8; 32]> {
     key
 }
 
-/// Create a new wrapped DEK envelope from a 256-bit unseal key, returning:
-/// `(EnvelopeHeader, sqlcipher_db_key, value_aead_key, audit_chain_key)`.
-pub fn create_envelope(
+fn wrap_master_dek_with_unseal_key(
     unseal_key: &[u8; 32],
-) -> Result<(EnvelopeHeader, LockedKey, LockedKey, LockedKey), CryptoError> {
+    master_dek: &[u8; 32],
+) -> Result<EnvelopeHeader, CryptoError> {
     let mut kdf_salt = [0u8; 32];
-    let mut master_dek = Zeroizing::new([0u8; 32]);
     let mut dek_nonce = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut kdf_salt);
-    rand::thread_rng().fill_bytes(master_dek.as_mut());
     rand::thread_rng().fill_bytes(&mut dek_nonce);
 
     let mut kek = Zeroizing::new([0u8; 32]);
@@ -199,31 +203,25 @@ pub fn create_envelope(
         .encrypt(
             Nonce::from_slice(&dek_nonce),
             Payload {
-                msg: master_dek.as_ref(),
+                msg: master_dek,
                 aad: ENVELOPE_AAD,
             },
         )
         .map_err(|_| CryptoError::AeadFailure)?;
 
-    let (db_key, aead_key, audit_key) = derive_subkeys(&master_dek)?;
-
-    let header = EnvelopeHeader {
+    Ok(EnvelopeHeader {
         version: 2,
         kdf: "hkdf-sha512".to_string(),
         kdf_salt_hex: hex_encode(kdf_salt),
         dek_nonce_hex: hex_encode(dek_nonce),
         wrapped_dek_hex: hex_encode(wrapped_dek),
-    };
-
-    Ok((header, db_key, aead_key, audit_key))
+    })
 }
 
-/// Verify and unwrap an existing `EnvelopeHeader` using the supplied unseal key.
-/// Fails with `CryptoError::InvalidUnsealKey` if the AEAD tag check fails.
-pub fn unwrap_envelope(
+fn unwrap_raw_master_dek(
     unseal_key: &[u8; 32],
     header: &EnvelopeHeader,
-) -> Result<(LockedKey, LockedKey, LockedKey), CryptoError> {
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     if header.version != 2 || header.kdf != "hkdf-sha512" {
         return Err(CryptoError::CorruptEnvelope);
     }
@@ -261,16 +259,61 @@ pub fn unwrap_envelope(
 
     let mut dek_arr = Zeroizing::new([0u8; 32]);
     dek_arr.copy_from_slice(&decrypted_dek);
+    Ok(dek_arr)
+}
+
+/// Create a new wrapped DEK envelope from a 256-bit unseal key, returning:
+/// `(EnvelopeHeader, sqlcipher_db_key, value_aead_key, audit_chain_key)`.
+pub fn create_envelope(
+    unseal_key: &[u8; 32],
+) -> Result<(EnvelopeHeader, LockedKey, LockedKey, LockedKey), CryptoError> {
+    let mut master_dek = Zeroizing::new([0u8; 32]);
+    rand::thread_rng().fill_bytes(master_dek.as_mut());
+
+    let header = wrap_master_dek_with_unseal_key(unseal_key, &master_dek)?;
+    let (db_key, aead_key, audit_key) = derive_subkeys(&master_dek)?;
+
+    Ok((header, db_key, aead_key, audit_key))
+}
+
+/// Verify and unwrap an existing `EnvelopeHeader` using the supplied unseal key.
+/// Fails with `CryptoError::InvalidUnsealKey` if the AEAD tag check fails.
+pub fn unwrap_envelope(
+    unseal_key: &[u8; 32],
+    header: &EnvelopeHeader,
+) -> Result<(LockedKey, LockedKey, LockedKey), CryptoError> {
+    let dek_arr = unwrap_raw_master_dek(unseal_key, header)?;
     derive_subkeys(&dek_arr)
 }
 
-/// Lock all current and future process virtual memory pages (`mlockall(MCL_CURRENT | MCL_FUTURE)`)
-/// when container `ulimits.memlock` permits, ensuring SQLCipher's internal C heap key schedule
-/// and SQLite page caches are also pinned in RAM and never paged to swap.
+/// Atomically re-wrap the existing `master_dek` under a newly generated 256-bit unseal key.
+/// Invalidates the old unseal key on disk without requiring secret re-encryption or downtime.
+pub fn rotate_envelope_unseal_key(
+    current_unseal_key: &[u8; 32],
+    current_header: &EnvelopeHeader,
+) -> Result<(Zeroizing<[u8; 32]>, EnvelopeHeader), CryptoError> {
+    let master_dek = unwrap_raw_master_dek(current_unseal_key, current_header)?;
+    let new_unseal_key = generate_unseal_key();
+    let new_header = wrap_master_dek_with_unseal_key(&new_unseal_key, &master_dek)?;
+    Ok((new_unseal_key, new_header))
+}
+
+/// Harden process memory without `mlockall(MCL_FUTURE)` (which causes `ENOMEM` panics when
+/// Tokio thread stacks or TLS buffers grow beyond `RLIMIT_MEMLOCK`).
+/// Disables core dumps / ptrace via `PR_SET_DUMPABLE = 0` and verifies targeted `LockedKey`
+/// `mlock()` availability for cryptographic key pages.
 pub fn lock_process_memory() -> bool {
     #[cfg(unix)]
     unsafe {
-        libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) == 0
+        let dumpable_res = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if dumpable_res != 0 {
+            tracing::warn!("prctl(PR_SET_DUMPABLE, 0) returned non-zero");
+        }
+        let mut probe = [0xAAu8; 32];
+        match LockedKey::from_mut_array(&mut probe) {
+            Ok(k) => k.is_memory_locked(),
+            Err(_) => false,
+        }
     }
     #[cfg(not(unix))]
     {
@@ -460,8 +503,23 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
         .collect()
 }
 
-/// Generate a self-signed X.509 certificate and private key using rcgen.
-/// Returns `(cert_pem, key_pem, fingerprint_sha256)`.
+/// Convert Unix epoch days (`days_since_1970`) into Gregorian `(year, month, day)`.
+fn civil_from_unix_days(days_since_epoch: i64) -> (i32, u8, u8) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u8, d as u8)
+}
+
+/// Generate a CA/Browser-Forum-compliant (`< 398` days) self-signed ECDSA P-256 X.509 certificate
+/// and private key using `rcgen`. Returns `(cert_pem, key_pem, fingerprint_sha256)`.
 pub fn generate_self_signed_tls_cert(
     san_list: &[String],
 ) -> Result<(String, String, String), String> {
@@ -471,12 +529,26 @@ pub fn generate_self_signed_tls_cert(
         san_list.to_vec()
     };
 
-    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
-        .map_err(|e| format!("Failed to generate self-signed certificate: {e}"))?;
+    let mut params = rcgen::CertificateParams::new(subject_alt_names)
+        .map_err(|e| format!("Invalid TLS SAN list: {e}"))?;
+    let now_days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(20_454);
+    let (y1, m1, d1) = civil_from_unix_days(now_days.saturating_sub(1));
+    let (y2, m2, d2) = civil_from_unix_days(now_days.saturating_add(396));
+    params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+    params.not_after = rcgen::date_time_ymd(y2, m2, d2);
 
-    let cert_pem = certified_key.cert.pem();
-    let key_pem = certified_key.signing_key.serialize_pem();
-    let cert_der = certified_key.cert.der();
+    let signing_key = rcgen::KeyPair::generate()
+        .map_err(|e| format!("Failed generating ECDSA TLS keypair: {e}"))?;
+    let cert = params
+        .self_signed(&signing_key)
+        .map_err(|e| format!("Failed generating self-signed TLS certificate: {e}"))?;
+
+    let cert_pem = cert.pem();
+    let key_pem = signing_key.serialize_pem();
+    let cert_der = cert.der();
 
     use sha2::Sha256;
     let digest = Sha256::digest(cert_der);
@@ -487,6 +559,35 @@ pub fn generate_self_signed_tls_cert(
         .join(":");
 
     Ok((cert_pem, key_pem, fingerprint_hex))
+}
+
+/// Construct a `rustls::ServerConfig` that strictly negotiates **TLS 1.3 only**
+/// (rejecting TLS 1.2 or older handshakes even if Cargo feature unification enables `tls12` in `rustls`).
+pub fn build_strict_tls13_server_config(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<Arc<rustls::ServerConfig>, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed parsing TLS certificate PEM: {e}"))?;
+    if certs.is_empty() {
+        return Err("TLS certificate PEM contained zero X.509 certificates".to_string());
+    }
+
+    let priv_key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| format!("Failed parsing TLS private key PEM: {e}"))?;
+
+    let mut cfg =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs, priv_key)
+            .map_err(|e| format!("Failed constructing strict TLS 1.3 ServerConfig: {e}"))?;
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(cfg))
 }
 
 /// Compute the SHA-256 fingerprint in colon-separated uppercase hex (`AA:BB:CC:...`)
@@ -527,7 +628,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_generate_self_signed_cert() {
+    fn test_generate_self_signed_cert_and_strict_tls13_config() {
         let (cert_pem, key_pem, fingerprint) =
             generate_self_signed_tls_cert(&["localhost".to_string(), "127.0.0.1".to_string()])
                 .expect("cert generation failed");
@@ -535,8 +636,29 @@ mod tests {
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
         assert_eq!(fingerprint.split(':').count(), 32);
 
-        // Verify compute_pem_fingerprint recovers the exact same SHA-256 fingerprint
         let parsed_fp = compute_pem_fingerprint(&cert_pem).expect("failed parsing PEM cert");
         assert_eq!(parsed_fp, fingerprint);
+
+        let _tls13 = build_strict_tls13_server_config(cert_pem.as_bytes(), key_pem.as_bytes())
+            .expect("strict TLS 1.3 config failed");
+    }
+
+    #[test]
+    fn test_rotate_envelope_unseal_key_preserves_subkeys_and_invalidates_old_key() {
+        let old_key = generate_unseal_key();
+        let (old_hdr, db1, aead1, aud1) = create_envelope(&old_key).expect("create envelope");
+
+        let (new_key, new_hdr) =
+            rotate_envelope_unseal_key(&old_key, &old_hdr).expect("rotate unseal key");
+        assert_ne!(old_key.as_ref(), new_key.as_ref());
+
+        // Old key must fail against rotated header
+        assert!(unwrap_envelope(&old_key, &new_hdr).is_err());
+
+        // New key must derive identical subkeys so SQLCipher + secret ciphertexts remain valid
+        let (db2, aead2, aud2) = unwrap_envelope(&new_key, &new_hdr).expect("unwrap rotated");
+        assert_eq!(db1.as_bytes(), db2.as_bytes());
+        assert_eq!(aead1.as_bytes(), aead2.as_bytes());
+        assert_eq!(aud1.as_bytes(), aud2.as_bytes());
     }
 }
