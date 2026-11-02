@@ -1,4 +1,5 @@
-//! SQLCipher 256-bit full-page encrypted SQLite persistence engine and `0600` envelope file I/O.
+//! SQLCipher 256-bit full-page encrypted SQLite persistence engine, atomic single-transaction
+//! HMAC-SHA512 audit chaining with external tail-truncation anchoring, and `0600` envelope file I/O.
 
 use crate::acl::ScopedToken;
 use crate::crypto::{
@@ -6,8 +7,9 @@ use crate::crypto::{
 };
 use crate::oidc::OidcBinding;
 use rand::RngCore;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::Write;
@@ -18,6 +20,7 @@ use zeroize::Zeroizing;
 
 const ENVELOPE_FILENAME: &str = "vault.envelope";
 const DB_FILENAME: &str = "vault.db";
+const AUDIT_ANCHOR_FILENAME: &str = "vault.audit_anchor";
 const AUDIT_GENESIS_MAC: &str = "GENESIS_SOVEREIGN_VAULT_V2";
 const MAX_BACKUP_SNAPSHOTS: usize = 20;
 
@@ -74,6 +77,16 @@ pub struct BackupMetadata {
     pub snapshot_id: String,
     pub backup_dir: String,
     pub total_bytes: u64,
+    pub sha256: String,
+}
+
+/// External HMAC-SHA512 authenticated high-water mark stored at `/data/vault.audit_anchor` (`0600`).
+/// Prevents an attacker with SQLite write access from truncating tail rows (`seq > K`) or wiping `audit_log`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditChainAnchor {
+    seq: i64,
+    entry_mac_sha512: String,
+    anchor_mac_sha512: String,
 }
 
 pub struct Storage {
@@ -95,6 +108,10 @@ pub fn envelope_path(data_dir: &Path) -> PathBuf {
 
 pub fn database_path(data_dir: &Path) -> PathBuf {
     data_dir.join(DB_FILENAME)
+}
+
+pub fn audit_anchor_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(AUDIT_ANCHOR_FILENAME)
 }
 
 pub fn is_vault_initialized(data_dir: &Path) -> bool {
@@ -129,6 +146,55 @@ pub fn read_envelope_header(data_dir: &Path) -> Result<EnvelopeHeader, StorageEr
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+fn compute_anchor_mac(audit_key: &LockedKey, seq: i64, entry_mac_sha512: &str) -> String {
+    compute_audit_chain_mac(
+        audit_key,
+        entry_mac_sha512,
+        seq,
+        0,
+        "sys.audit.anchor",
+        "vault",
+        "audit_anchor",
+        "ok",
+    )
+}
+
+fn write_audit_anchor(
+    data_dir: &Path,
+    audit_key: &LockedKey,
+    seq: i64,
+    entry_mac_sha512: &str,
+) -> Result<(), StorageError> {
+    let anchor = AuditChainAnchor {
+        seq,
+        entry_mac_sha512: entry_mac_sha512.to_string(),
+        anchor_mac_sha512: compute_anchor_mac(audit_key, seq, entry_mac_sha512),
+    };
+    let tmp_path = data_dir.join("vault.audit_anchor.tmp");
+    let final_path = audit_anchor_path(data_dir);
+    let payload = serde_json::to_vec(&anchor)?;
+
+    let mut file = fs::File::create(&tmp_path)?;
+    set_mode_0600(&tmp_path)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    drop(file);
+
+    fs::rename(&tmp_path, &final_path)?;
+    set_mode_0600(&final_path)?;
+    Ok(())
+}
+
+fn read_audit_anchor(data_dir: &Path) -> Result<Option<AuditChainAnchor>, StorageError> {
+    let p = audit_anchor_path(data_dir);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(p)?;
+    let anchor: AuditChainAnchor = serde_json::from_slice(&bytes)?;
+    Ok(Some(anchor))
+}
+
 fn ensure_secure_dir(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -150,10 +216,54 @@ fn set_mode_0600(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn append_audit_in_tx(
+    tx: &Transaction<'_>,
+    audit_key: &LockedKey,
+    event_type: &str,
+    actor: &str,
+    resource: &str,
+    outcome: &str,
+) -> Result<AuditLogEntry, StorageError> {
+    let now = now_unix_seconds();
+    let last: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT seq, entry_mac_sha512 FROM audit_log ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+
+    let (seq, prev_mac) = match last {
+        Some((last_seq, last_mac)) => (last_seq + 1, last_mac),
+        None => (1, AUDIT_GENESIS_MAC.to_string()),
+    };
+
+    let entry_mac = compute_audit_chain_mac(
+        audit_key, &prev_mac, seq, now, event_type, actor, resource, outcome,
+    );
+
+    tx.execute(
+        "INSERT INTO audit_log (seq, timestamp, event_type, actor, resource, outcome, prev_mac_sha512, entry_mac_sha512)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
+    )?;
+
+    Ok(AuditLogEntry {
+        seq,
+        timestamp: now,
+        event_type: event_type.to_string(),
+        actor: actor.to_string(),
+        resource: resource.to_string(),
+        outcome: outcome.to_string(),
+        prev_mac_sha512: prev_mac,
+        entry_mac_sha512: entry_mac,
+    })
+}
+
 impl Storage {
-    /// Open or create the SQLCipher-encrypted database inside `data_dir` using the 256-bit `sqlcipher_key`.
-    /// Every 4KB database page (including table schemas, path indices, and WAL frames) is encrypted
-    /// via AES-256 and authenticated with `HMAC_SHA512`.
+    /// Open or create the SQLCipher-encrypted database inside `data_dir` using the 256-bit HKDF-derived `sqlcipher_key`.
+    /// Enables `cipher_memory_security = ON` BEFORE `PRAGMA key` so SQLCipher's initial key schedule
+    /// and page-cache allocations use sanitized memory hooks from inception.
     pub fn open_encrypted(
         data_dir: &Path,
         sqlcipher_key: &LockedKey,
@@ -163,6 +273,10 @@ impl Storage {
         let conn = Connection::open(&db_path)?;
         set_mode_0600(&db_path)?;
 
+        // Must precede `PRAGMA key` so internal SQLCipher cipher contexts are memory-sanitized.
+        conn.execute_batch("PRAGMA cipher_memory_security = ON;")?;
+
+        // Pass the 256-bit HKDF-SHA512 subkey directly via SQLCipher raw-key hex syntax (`x'<64-hex>'`).
         let raw_hex = Zeroizing::new(hex_encode(sqlcipher_key.as_bytes()));
         let key_pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", raw_hex.as_str()));
         conn.execute_batch(key_pragma.as_str())?;
@@ -170,8 +284,6 @@ impl Storage {
         conn.execute_batch(
             "PRAGMA cipher_page_size = 4096;
              PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
-             PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
-             PRAGMA cipher_memory_security = ON;
              PRAGMA secure_delete = ON;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
@@ -235,7 +347,6 @@ impl Storage {
              );",
         )?;
 
-        // Tighten permissions on WAL/SHM sidecar files if created
         let _ = set_mode_0600(&data_dir.join("vault.db-wal"));
         let _ = set_mode_0600(&data_dir.join("vault.db-shm"));
 
@@ -260,7 +371,44 @@ impl Storage {
         Ok(current.unwrap_or(0) + 1)
     }
 
-    /// Atomically persist a new secret version and update the active pointer row.
+    /// Atomically persist a new secret version, update the active pointer row, and append the
+    /// HMAC-SHA512 `secret.put` audit record in a single SQLite transaction.
+    pub fn put_secret_versioned_audited(
+        &mut self,
+        path: &str,
+        project: &str,
+        version: i64,
+        ciphertext: &[u8],
+        nonce: &[u8; 12],
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<AuditLogEntry, StorageError> {
+        let now = now_unix_seconds();
+        let outcome = format!("v{version}");
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO secret_versions (path, version, project, ciphertext, nonce, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            params![path, version, project, ciphertext, nonce.as_slice(), now],
+        )?;
+        tx.execute(
+            "INSERT INTO secrets (path, project, current_version, ciphertext, nonce, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(path) DO UPDATE SET
+                 project = excluded.project,
+                 current_version = excluded.current_version,
+                 ciphertext = excluded.ciphertext,
+                 nonce = excluded.nonce,
+                 updated_at = excluded.updated_at",
+            params![path, project, version, ciphertext, nonce.as_slice(), now],
+        )?;
+        let entry = append_audit_in_tx(&tx, audit_key, "secret.put", actor, path, &outcome)?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(entry)
+    }
+
+    /// Atomically persist a new secret version without an audit row (kept for direct storage callers).
     pub fn put_secret_versioned(
         &mut self,
         path: &str,
@@ -344,8 +492,26 @@ impl Storage {
         }
     }
 
-    /// Cryptographically shred a secret path from both `secrets` and `secret_versions`
-    /// inside an atomic transaction (`PRAGMA secure_delete = ON` overwrites freed SQLCipher pages).
+    /// Cryptographically shred a secret path and record `secret.delete` atomically in a single transaction.
+    pub fn delete_secret_audited(
+        &mut self,
+        path: &str,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<Option<AuditLogEntry>, StorageError> {
+        let tx = self.conn.transaction()?;
+        let _ = tx.execute("DELETE FROM secret_versions WHERE path = ?", params![path])?;
+        let affected = tx.execute("DELETE FROM secrets WHERE path = ?", params![path])?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        let entry = append_audit_in_tx(&tx, audit_key, "secret.delete", actor, path, "deleted")?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(Some(entry))
+    }
+
+    /// Cryptographically shred a secret path from both `secrets` and `secret_versions`.
     pub fn delete_secret(&mut self, path: &str) -> Result<bool, StorageError> {
         let tx = self.conn.transaction()?;
         let _ = tx.execute("DELETE FROM secret_versions WHERE path = ?", params![path])?;
@@ -383,6 +549,44 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist a machine token and append `token.enroll` atomically in a single SQLite transaction.
+    pub fn put_token_audited(
+        &mut self,
+        token_id: &str,
+        token_hash_sha512: &str,
+        project: &str,
+        name: &str,
+        allowed_paths: &[String],
+        capabilities: &[String],
+        expires_at: Option<i64>,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<AuditLogEntry, StorageError> {
+        let paths_json = serde_json::to_string(allowed_paths)?;
+        let caps_json = serde_json::to_string(capabilities)?;
+        let now = now_unix_seconds();
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tokens (token_id, token_hash_sha512, project, name, allowed_paths, capabilities, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                token_id,
+                token_hash_sha512,
+                project,
+                name,
+                paths_json,
+                caps_json,
+                expires_at,
+                now
+            ],
+        )?;
+        let entry = append_audit_in_tx(&tx, audit_key, "token.enroll", actor, token_id, "created")?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(entry)
     }
 
     pub fn get_token_by_id(&self, token_id: &str) -> Result<Option<ScopedToken>, StorageError> {
@@ -424,11 +628,84 @@ impl Storage {
         }
     }
 
+    pub fn delete_token_audited(
+        &mut self,
+        token_id: &str,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<Option<AuditLogEntry>, StorageError> {
+        let tx = self.conn.transaction()?;
+        let affected = tx.execute("DELETE FROM tokens WHERE token_id = ?", params![token_id])?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        let entry =
+            append_audit_in_tx(&tx, audit_key, "token.revoke", actor, token_id, "revoked")?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(Some(entry))
+    }
+
     pub fn delete_token(&self, token_id: &str) -> Result<bool, StorageError> {
         let affected = self
             .conn
             .execute("DELETE FROM tokens WHERE token_id = ?", params![token_id])?;
         Ok(affected > 0)
+    }
+
+    /// Persist a new OIDC Workload Identity Binding and append `oidc.binding.enroll` atomically.
+    pub fn put_oidc_binding_audited(
+        &mut self,
+        binding: &OidcBinding,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<AuditLogEntry, StorageError> {
+        let paths_json = serde_json::to_string(&binding.allowed_paths)?;
+        let caps_json = serde_json::to_string(&binding.capabilities)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO oidc_bindings (
+                 binding_id, name, project, issuer, audience, jwks_uri,
+                 subject_claim, subject_pattern, allowed_paths, capabilities,
+                 inline_jwks_json, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(binding_id) DO UPDATE SET
+                 name = excluded.name,
+                 project = excluded.project,
+                 issuer = excluded.issuer,
+                 audience = excluded.audience,
+                 jwks_uri = excluded.jwks_uri,
+                 subject_claim = excluded.subject_claim,
+                 subject_pattern = excluded.subject_pattern,
+                 allowed_paths = excluded.allowed_paths,
+                 capabilities = excluded.capabilities,
+                 inline_jwks_json = excluded.inline_jwks_json",
+            params![
+                binding.binding_id,
+                binding.name,
+                binding.project,
+                binding.issuer,
+                binding.audience,
+                binding.jwks_uri,
+                binding.subject_claim,
+                binding.subject_pattern,
+                paths_json,
+                caps_json,
+                binding.inline_jwks_json,
+                binding.created_at,
+            ],
+        )?;
+        let entry = append_audit_in_tx(
+            &tx,
+            audit_key,
+            "oidc.binding.enroll",
+            actor,
+            &binding.binding_id,
+            "created",
+        )?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(entry)
     }
 
     /// Persist a new OIDC Workload Identity Binding into SQLCipher.
@@ -530,6 +807,34 @@ impl Storage {
         Ok(out)
     }
 
+    /// Delete an OIDC Workload Identity Binding and append `oidc.binding.revoke` atomically.
+    pub fn delete_oidc_binding_audited(
+        &mut self,
+        binding_id: &str,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<Option<AuditLogEntry>, StorageError> {
+        let tx = self.conn.transaction()?;
+        let affected = tx.execute(
+            "DELETE FROM oidc_bindings WHERE binding_id = ?",
+            params![binding_id],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        let entry = append_audit_in_tx(
+            &tx,
+            audit_key,
+            "oidc.binding.revoke",
+            actor,
+            binding_id,
+            "revoked",
+        )?;
+        tx.commit()?;
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(Some(entry))
+    }
+
     /// Delete an OIDC Workload Identity Binding by `binding_id`.
     pub fn delete_oidc_binding(&self, binding_id: &str) -> Result<bool, StorageError> {
         let affected = self.conn.execute(
@@ -628,7 +933,8 @@ impl Storage {
         Ok(out)
     }
 
-    /// Append a tamper-evident, HMAC-SHA512 hash-chained audit event inside SQLCipher.
+    /// Append a tamper-evident, HMAC-SHA512 hash-chained audit event inside SQLCipher
+    /// and update the external HMAC-signed high-water anchor (`vault.audit_anchor`).
     pub fn append_audit_event(
         &mut self,
         audit_key: &LockedKey,
@@ -637,45 +943,16 @@ impl Storage {
         resource: &str,
         outcome: &str,
     ) -> Result<AuditLogEntry, StorageError> {
-        let now = now_unix_seconds();
         let tx = self.conn.transaction()?;
-        let last: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT seq, entry_mac_sha512 FROM audit_log ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-
-        let (seq, prev_mac) = match last {
-            Some((last_seq, last_mac)) => (last_seq + 1, last_mac),
-            None => (1, AUDIT_GENESIS_MAC.to_string()),
-        };
-
-        let entry_mac = compute_audit_chain_mac(
-            audit_key, &prev_mac, seq, now, event_type, actor, resource, outcome,
-        );
-
-        tx.execute(
-            "INSERT INTO audit_log (seq, timestamp, event_type, actor, resource, outcome, prev_mac_sha512, entry_mac_sha512)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
-        )?;
+        let entry = append_audit_in_tx(&tx, audit_key, event_type, actor, resource, outcome)?;
         tx.commit()?;
-        Ok(AuditLogEntry {
-            seq,
-            timestamp: now,
-            event_type: event_type.to_string(),
-            actor: actor.to_string(),
-            resource: resource.to_string(),
-            outcome: outcome.to_string(),
-            prev_mac_sha512: prev_mac,
-            entry_mac_sha512: entry_mac,
-        })
+        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
+        Ok(entry)
     }
 
-    /// Recompute and verify the entire HMAC-SHA512 hash chain from genesis (`seq = 1..=N`),
-    /// returning `(chain_verified, total_events, tail_events)`.
+    /// Recompute and verify the entire HMAC-SHA512 hash chain from genesis (`seq = 1..=N`)
+    /// AND verify the external tail anchor (`/data/vault.audit_anchor`) to detect tail truncation
+    /// or full-table deletion.
     pub fn verify_and_list_audit_log(
         &self,
         audit_key: &LockedKey,
@@ -734,6 +1011,29 @@ impl Storage {
             tail_ring.push_back(entry);
         }
 
+        // An initialized vault MUST always have at least `seq = 1` (`sys.init`).
+        if total == 0 {
+            valid = false;
+        }
+
+        // Verify against external high-water anchor to catch tail-row deletion (`seq > K`)
+        // or attacker deletion/corruption of the anchor file itself.
+        match read_audit_anchor(&self.data_dir) {
+            Ok(Some(anchor)) => {
+                let expected_anchor_mac =
+                    compute_anchor_mac(audit_key, anchor.seq, &anchor.entry_mac_sha512);
+                if !constant_time_str_eq(&anchor.anchor_mac_sha512, &expected_anchor_mac)
+                    || (total as i64) != anchor.seq
+                    || !constant_time_str_eq(&expected_prev, &anchor.entry_mac_sha512)
+                {
+                    valid = false;
+                }
+            }
+            Ok(None) | Err(_) => {
+                valid = false;
+            }
+        }
+
         Ok((valid, total, tail_ring.into_iter().collect()))
     }
 
@@ -747,12 +1047,19 @@ impl Storage {
         Ok(count)
     }
 
-    /// Perform an online encrypted backup by checkpointing WAL frames into `vault.db`
-    /// and streaming `vault.db` + `vault.envelope` into a `0700`/`0600` snapshot directory.
-    /// Automatically prunes oldest snapshots beyond `MAX_BACKUP_SNAPSHOTS`.
+    /// Perform an online encrypted backup by verifying non-busy WAL checkpoint truncation,
+    /// copying `vault.db` + `vault.envelope` (+ `vault.audit_anchor` if present) into a `0700`/`0600`
+    /// snapshot directory, and computing a cryptographic SHA-256 digest of the snapshot.
     pub fn create_encrypted_backup(&self) -> Result<BackupMetadata, StorageError> {
-        self.conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let busy_flag: i64 =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy_flag != 0 {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "SQLCipher WAL checkpoint busy; retry backup when concurrent reader finishes",
+            )));
+        }
 
         let now = now_unix_seconds();
         let mut suffix = [0u8; 4];
@@ -770,12 +1077,27 @@ impl Storage {
         let db_bytes = copy_file_0600_synced(&self.db_path, &dst_db)?;
         let env_bytes = copy_file_0600_synced(&envelope_path(&self.data_dir), &dst_env)?;
 
+        let anchor_src = audit_anchor_path(&self.data_dir);
+        let anchor_bytes = if anchor_src.is_file() {
+            copy_file_0600_synced(&anchor_src, &snap_dir.join(AUDIT_ANCHOR_FILENAME))?
+        } else {
+            0
+        };
+
+        let db_raw = fs::read(&dst_db)?;
+        let env_raw = fs::read(&dst_env)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&db_raw);
+        hasher.update(&env_raw);
+        let sha256 = hex_encode(hasher.finalize());
+
         prune_excess_backups(&backups_root, MAX_BACKUP_SNAPSHOTS);
 
         Ok(BackupMetadata {
             snapshot_id,
             backup_dir: snap_dir.to_string_lossy().to_string(),
-            total_bytes: db_bytes + env_bytes,
+            total_bytes: db_bytes + env_bytes + anchor_bytes,
+            sha256,
         })
     }
 }
@@ -799,12 +1121,11 @@ fn prune_excess_backups(backups_root: &Path, keep_max: usize) {
         .map(|e| e.path())
         .filter(|p| p.is_dir())
         .collect();
-    if dirs.len() <= keep_max {
-        return;
-    }
     dirs.sort();
-    let remove_count = dirs.len().saturating_sub(keep_max);
-    for old_dir in dirs.into_iter().take(remove_count) {
-        let _ = fs::remove_dir_all(old_dir);
+    if dirs.len() > keep_max {
+        let remove_count = dirs.len() - keep_max;
+        for old in dirs.into_iter().take(remove_count) {
+            let _ = fs::remove_dir_all(old);
+        }
     }
 }

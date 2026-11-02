@@ -644,6 +644,7 @@ async fn test_online_encrypted_backup_and_restore() {
     let backup_dir = std::path::PathBuf::from(bk_body["backup_dir"].as_str().unwrap());
     assert!(backup_dir.join("vault.db").is_file());
     assert!(backup_dir.join("vault.envelope").is_file());
+    assert!(backup_dir.join("vault.audit_anchor").is_file());
 
     // Restore snapshot into a brand-new directory and unseal a fresh daemon instance
     let restore_dir = TempDir::new().expect("restore tempdir");
@@ -655,6 +656,11 @@ async fn test_online_encrypted_backup_and_restore() {
     std::fs::copy(
         backup_dir.join("vault.envelope"),
         restore_dir.path().join("vault.envelope"),
+    )
+    .unwrap();
+    std::fs::copy(
+        backup_dir.join("vault.audit_anchor"),
+        restore_dir.path().join("vault.audit_anchor"),
     )
     .unwrap();
 
@@ -1063,7 +1069,7 @@ async fn test_v0_3_dual_mode_oidc_jwt_auth_presets_refresh_and_metrics() {
     assert!(prom_raw.contains("vault_oidc_bindings_active 1"));
     assert!(prom_raw.contains("vault_oidc_jwks_keys_cached 1"));
 
-    // 9. Revoking the OIDC binding immediately invalidates the JWT (`401 Unauthorized`)
+    // 9. Revoking the OIDC binding immediately invalidates the JWT (`401 Unauthorized`) and purges cached keys
     let (del_oid_st, _) = send_json(
         &app,
         Method::DELETE,
@@ -1073,6 +1079,17 @@ async fn test_v0_3_dual_mode_oidc_jwt_auth_presets_refresh_and_metrics() {
     )
     .await;
     assert_eq!(del_oid_st, StatusCode::NO_CONTENT);
+
+    let (post_list_st, post_list_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(post_list_st, StatusCode::OK);
+    assert_eq!(post_list_body["total_cached_keys"], 0);
 
     let (post_del_st, _) = send_json(
         &app,
@@ -1090,7 +1107,7 @@ async fn test_native_tls_rustls_encryption_in_transit() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (_dir, _state, app, _unseal_key, _admin_token) = bootstrap_test_vault().await;
 
-    // 1. Generate autonomous self-signed certificate for localhost/127.0.0.1
+    // 1. Generate autonomous 397-day self-signed certificate for localhost/127.0.0.1
     let (cert_pem, key_pem, fp) = sovereign_vault::crypto::generate_self_signed_tls_cert(&[
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -1098,12 +1115,12 @@ async fn test_native_tls_rustls_encryption_in_transit() {
     .expect("generate test tls cert");
     assert_eq!(fp.split(':').count(), 32);
 
-    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_pem(
-        cert_pem.as_bytes().to_vec(),
-        key_pem.as_bytes().to_vec(),
+    let strict_tls13 = sovereign_vault::crypto::build_strict_tls13_server_config(
+        cert_pem.as_bytes(),
+        key_pem.as_bytes(),
     )
-    .await
-    .expect("load rustls config");
+    .expect("strict tls13 server config");
+    let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(strict_tls13);
 
     // 2. Bind to an ephemeral port on 127.0.0.1
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -1112,17 +1129,18 @@ async fn test_native_tls_rustls_encryption_in_transit() {
 
     let server_handle = tokio::spawn(async move {
         let _ = axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await;
     });
 
     // Wait briefly for server startup
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    // 3. Client connecting with CA cert verification succeeds
+    // 3. Client connecting with CA cert verification over TLS 1.3 succeeds
     let root_cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse root cert");
     let trusted_client = reqwest::Client::builder()
-        .add_root_certificate(root_cert)
+        .add_root_certificate(root_cert.clone())
+        .min_tls_version(reqwest::tls::Version::TLS_1_3)
         .build()
         .expect("build client");
 
@@ -1133,18 +1151,20 @@ async fn test_native_tls_rustls_encryption_in_transit() {
         .expect("https request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
-    // 4. Client connecting with -k / danger_accept_invalid_certs succeeds
-    let insecure_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+    // 4. Client forcing TLS 1.2 max version MUST be rejected by strict TLS 1.3 ServerConfig
+    let tls12_only_client = reqwest::Client::builder()
+        .add_root_certificate(root_cert)
+        .max_tls_version(reqwest::tls::Version::TLS_1_2)
         .build()
-        .expect("build insecure client");
-
-    let resp2 = insecure_client
-        .get(format!("https://127.0.0.1:{}/v1/sys/health", addr.port()))
+        .expect("build tls12 client");
+    let tls12_res = tls12_only_client
+        .get(format!("https://localhost:{}/v1/sys/health", addr.port()))
         .send()
-        .await
-        .expect("https request");
-    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+        .await;
+    assert!(
+        tls12_res.is_err(),
+        "TLS 1.2 downgrade attempt must fail handshake against strict TLS 1.3 ServerConfig"
+    );
 
     // 5. Plain HTTP request to TLS port is rejected / fails handshake
     let plain_client = reqwest::Client::new();
@@ -1155,4 +1175,490 @@ async fn test_native_tls_rustls_encryption_in_transit() {
     assert!(plain_fail.is_err(), "Cleartext HTTP to TLS port must fail");
 
     server_handle.abort();
+}
+
+async fn send_json_from_ip(
+    app: &Router,
+    peer: std::net::SocketAddr,
+    method: Method,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    let req_body = match body {
+        Some(val) => {
+            builder = builder.header("Content-Type", "application/json");
+            Body::from(serde_json::to_vec(&val).expect("serialize request json"))
+        }
+        None => Body::empty(),
+    };
+    let mut req = builder.body(req_body).expect("build http request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+
+    let resp = app.clone().oneshot(req).await.expect("dispatch request");
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .expect("read response body");
+    if bytes.is_empty() {
+        (status, Value::Null)
+    } else {
+        let parsed = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
+        (status, parsed)
+    }
+}
+
+#[tokio::test]
+async fn test_per_ip_rate_limiter_isolates_attacker_from_legitimate_operator() {
+    let dir = TempDir::new().expect("tempdir");
+    let nonce = "init_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let state = Arc::new(AppState::with_rate_limit(
+        dir.path().to_path_buf(),
+        Some(nonce.to_string()),
+        false,
+        3,
+    ));
+    let app = create_router(state);
+
+    let local_op: std::net::SocketAddr = "127.0.0.1:45000".parse().unwrap();
+    let attacker_ip: std::net::SocketAddr = "203.0.113.99:51234".parse().unwrap();
+
+    // Initialize and immediately seal the vault
+    let (init_st, init_body) = send_json_from_ip(
+        &app,
+        local_op,
+        Method::POST,
+        "/v1/sys/init",
+        &[("X-Vault-Bootstrap-Nonce", nonce)],
+        None,
+    )
+    .await;
+    assert_eq!(init_st, StatusCode::OK);
+    let unseal_key = init_body["unseal_key"].as_str().unwrap().to_string();
+    let admin_token = init_body["admin_token"].as_str().unwrap().to_string();
+
+    let (seal_st, _) = send_json_from_ip(
+        &app,
+        local_op,
+        Method::POST,
+        "/v1/sys/seal",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(seal_st, StatusCode::OK);
+
+    // Attacker sends 3 invalid unseal keys -> 401, then 4th is throttled with 429
+    let wrong_key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    for _ in 0..3 {
+        let (st, _) = send_json_from_ip(
+            &app,
+            attacker_ip,
+            Method::POST,
+            "/v1/sys/unseal",
+            &[],
+            Some(json!({ "unseal_key": wrong_key })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (throttled_st, _) = send_json_from_ip(
+        &app,
+        attacker_ip,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": wrong_key })),
+    )
+    .await;
+    assert_eq!(throttled_st, StatusCode::TOO_MANY_REQUESTS);
+
+    // Legitimate localhost operator is completely unaffected by attacker's rate-limit bucket!
+    let (unseal_st, _) = send_json_from_ip(
+        &app,
+        local_op,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": unseal_key })),
+    )
+    .await;
+    assert_eq!(unseal_st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_oidc_ssrf_block_and_cross_project_inline_jwks_isolation() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    let (_dir, _state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. SSRF checks at enrollment time: cleartext HTTP, cloud IMDS 169.254.169.254, and loopback jwks_uri must fail 400
+    for (bad_issuer, bad_jwks) in [
+        ("http://idp.example.com", "https://idp.example.com/jwks"),
+        (
+            "https://169.254.169.254/latest",
+            "https://169.254.169.254/latest/meta-data",
+        ),
+        (
+            "https://idp.example.com",
+            "https://127.0.0.1:8080/.well-known/jwks.json",
+        ),
+        (
+            "https://idp.example.com",
+            "https://10.0.0.5/.well-known/jwks.json",
+        ),
+    ] {
+        let (st, _) = send_json(
+            &app,
+            Method::POST,
+            "/v1/sys/oidc/bindings",
+            &[("X-Vault-Token", &admin_token)],
+            Some(json!({
+                "preset": "custom",
+                "project": "secops",
+                "name": "ssrf-attempt",
+                "issuer": bad_issuer,
+                "jwks_uri": bad_jwks,
+                "subject_pattern": "*",
+                "allowed_paths": ["secops/*"],
+                "capabilities": ["read"]
+            })),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "Expected SSRF rejection for ({bad_issuer}, {bad_jwks})"
+        );
+    }
+
+    // 2. Cross-project inline JWKS isolation: two bindings share the exact same `issuer`,
+    //    each with its own Ed25519 keypair. Key B must NEVER verify against Binding A!
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8_a = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let kp_a = Ed25519KeyPair::from_pkcs8(pkcs8_a.as_ref()).unwrap();
+    let pkcs8_b = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let kp_b = Ed25519KeyPair::from_pkcs8(pkcs8_b.as_ref()).unwrap();
+
+    let jwks_a = json!({
+        "keys": [{
+            "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": "shared-kid",
+            "x": URL_SAFE_NO_PAD.encode(kp_a.public_key().as_ref())
+        }]
+    })
+    .to_string();
+    let jwks_b = json!({
+        "keys": [{
+            "kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": "shared-kid",
+            "x": URL_SAFE_NO_PAD.encode(kp_b.public_key().as_ref())
+        }]
+    })
+    .to_string();
+
+    let _ = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/alpha/db_pass",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "alpha", "value": "alpha-crown-jewel" })),
+    )
+    .await;
+
+    let (st_a, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "preset": "custom",
+            "project": "alpha",
+            "name": "alpha-idp",
+            "issuer": "https://shared-idp.example.com",
+            "audience": "sovereign-vault",
+            "subject_pattern": "svc:alpha:*",
+            "allowed_paths": ["alpha/*"],
+            "capabilities": ["read"],
+            "inline_jwks_json": jwks_a
+        })),
+    )
+    .await;
+    assert_eq!(st_a, StatusCode::CREATED);
+
+    let (st_b, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "preset": "custom",
+            "project": "beta",
+            "name": "beta-idp",
+            "issuer": "https://shared-idp.example.com",
+            "audience": "sovereign-vault",
+            "subject_pattern": "svc:beta:*",
+            "allowed_paths": ["beta/*"],
+            "capabilities": ["read"],
+            "inline_jwks_json": jwks_b
+        })),
+    )
+    .await;
+    assert_eq!(st_b, StatusCode::CREATED);
+
+    // Forged token signed with kp_b claiming `sub: "svc:alpha:api"` must fail 401!
+    let now = sovereign_vault::storage::now_unix_seconds();
+    let hdr_b64 = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&json!({"alg": "EdDSA", "typ": "JWT", "kid": "shared-kid"})).unwrap());
+    let forged_claims_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iss": "https://shared-idp.example.com",
+            "sub": "svc:alpha:api",
+            "aud": "sovereign-vault",
+            "iat": now - 5,
+            "exp": now + 300
+        }))
+        .unwrap(),
+    );
+    let forged_input = format!("{hdr_b64}.{forged_claims_b64}");
+    let forged_sig = kp_b.sign(forged_input.as_bytes());
+    let forged_jwt = format!("Bearer {forged_input}.{}", URL_SAFE_NO_PAD.encode(forged_sig.as_ref()));
+
+    let (forged_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/alpha/db_pass",
+        &[("Authorization", &forged_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(forged_st, StatusCode::UNAUTHORIZED);
+
+    // Legitimate token signed with kp_a succeeds 200 OK
+    let valid_sig = kp_a.sign(forged_input.as_bytes());
+    let valid_jwt = format!("Bearer {forged_input}.{}", URL_SAFE_NO_PAD.encode(valid_sig.as_ref()));
+    let (ok_st, ok_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/alpha/db_pass",
+        &[("Authorization", &valid_jwt)],
+        None,
+    )
+    .await;
+    assert_eq!(ok_st, StatusCode::OK);
+    assert_eq!(ok_body["value"], "alpha-crown-jewel");
+}
+
+#[tokio::test]
+async fn test_audit_log_anchor_detects_tail_truncation_and_full_wipe() {
+    let (dir, _state, app, unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    let (put_st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/audit/test_key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "audit", "value": "val-1" })),
+    )
+    .await;
+    assert_eq!(put_st, StatusCode::OK);
+
+    // Baseline audit chain is valid and anchor file exists on disk
+    let anchor_file = sovereign_vault::storage::audit_anchor_path(dir.path());
+    assert!(anchor_file.is_file(), "vault.audit_anchor must exist");
+    let (aud_st, aud_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud_st, StatusCode::OK);
+    assert_eq!(aud_body["chain_verified"], true);
+
+    // Seal vault, open SQLCipher directly using the legitimate key, and truncate the latest row
+    let _ = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/seal",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+
+    let key_bytes = sovereign_vault::crypto::hex_decode(&unseal_key).unwrap();
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key_bytes);
+    let hdr = sovereign_vault::storage::read_envelope_header(dir.path()).unwrap();
+    let (db_key, _, _) = sovereign_vault::crypto::unwrap_envelope(&key_arr, &hdr).unwrap();
+    {
+        let conn = rusqlite::Connection::open(database_path(dir.path())).unwrap();
+        let hex_db_key = sovereign_vault::crypto::hex_encode(db_key.as_bytes());
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{hex_db_key}'\";
+             PRAGMA cipher_page_size = 4096;
+             PRAGMA kdf_iter = 256000;
+             PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
+             DELETE FROM audit_log WHERE seq = (SELECT MAX(seq) FROM audit_log);"
+        ))
+        .expect("tail-truncate audit_log");
+    }
+
+    // Note: unseal appends a new `sys.unseal` row and re-anchors IF unsealed, so let's verify
+    // `Storage::verify_and_list_audit_log` directly BEFORE unsealing (simulating an attacker
+    // truncating the live or offline DB without updating the HMAC-protected anchor)!
+    {
+        let (_, _, audit_key) = sovereign_vault::crypto::unwrap_envelope(&key_arr, &hdr).unwrap();
+        let storage = sovereign_vault::storage::Storage::open_encrypted(dir.path(), &db_key).unwrap();
+        let (valid_after_tail_delete, _, _) =
+            storage.verify_and_list_audit_log(&audit_key, 50).unwrap();
+        assert!(
+            !valid_after_tail_delete,
+            "External vault.audit_anchor MUST catch tail-truncation of audit_log"
+        );
+    }
+
+    // Also unseal and corrupt `vault.audit_anchor` while unsealed -> `/v1/sys/audit` MUST return `chain_verified == false`
+    let (unseal_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": unseal_key })),
+    )
+    .await;
+    assert_eq!(unseal_st, StatusCode::OK);
+
+    std::fs::remove_file(&anchor_file).expect("delete anchor file to simulate attacker rollback");
+    let (aud2_st, aud2_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud2_st, StatusCode::OK);
+    assert_eq!(
+        aud2_body["chain_verified"], false,
+        "Deleting vault.audit_anchor must immediately invalidate chain_verified"
+    );
+}
+
+#[tokio::test]
+async fn test_online_rotate_unseal_key_invalidates_old_key_and_preserves_secrets() {
+    let (dir, _state, app, old_unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. Persist a secret and create a backup (verifying sha256 digest field on BackupMetadata)
+    let (put_st, _) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/prod/stripe/webhook_secret",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "project": "prod", "value": "whsec_live_super_secret_rotate_test" })),
+    )
+    .await;
+    assert_eq!(put_st, StatusCode::OK);
+
+    let (bak_st, bak_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/backup",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(bak_st, StatusCode::CREATED);
+    let snap_sha = bak_body["sha256"].as_str().expect("backup sha256");
+    assert_eq!(snap_sha.len(), 64);
+
+    // 2. Wrong current_unseal_key is rejected with 401
+    let (bad_rot_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/rotate-unseal-key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "current_unseal_key": "0000000000000000000000000000000000000000000000000000000000000000"
+        })),
+    )
+    .await;
+    assert_eq!(bad_rot_st, StatusCode::UNAUTHORIZED);
+
+    // 3. Valid online KEK rotation succeeds and returns a brand-new 64-hex unseal key
+    let (rot_st, rot_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/rotate-unseal-key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "current_unseal_key": old_unseal_key })),
+    )
+    .await;
+    assert_eq!(rot_st, StatusCode::OK);
+    let new_unseal_key = rot_body["new_unseal_key"]
+        .as_str()
+        .expect("new_unseal_key")
+        .to_string();
+    assert_eq!(new_unseal_key.len(), 64);
+    assert_ne!(new_unseal_key, old_unseal_key);
+
+    // 4. Seal vault -> old unseal key MUST fail with 401 -> new unseal key unseals 200 OK!
+    let (seal_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/seal",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(seal_st, StatusCode::OK);
+
+    let (old_unseal_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": old_unseal_key })),
+    )
+    .await;
+    assert_eq!(old_unseal_st, StatusCode::UNAUTHORIZED);
+
+    let (new_unseal_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/unseal",
+        &[],
+        Some(json!({ "unseal_key": new_unseal_key })),
+    )
+    .await;
+    assert_eq!(new_unseal_st, StatusCode::OK);
+
+    // 5. Existing secret and HMAC-SHA512 audit chain + anchor remain 100% intact
+    let (get_st, get_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/prod/stripe/webhook_secret",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(get_st, StatusCode::OK);
+    assert_eq!(get_body["value"], "whsec_live_super_secret_rotate_test");
+
+    let (aud_st, aud_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud_st, StatusCode::OK);
+    assert_eq!(aud_body["chain_verified"], true);
+    let _ = envelope_path(dir.path());
 }
