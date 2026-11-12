@@ -318,20 +318,23 @@ impl OidcJwksCache {
         self.inner.read().ok()?.by_binding.get(binding_id).cloned()
     }
 
-    /// Retrieve manual/fallback cached keys for a normalized issuer.
+    /// Retrieve manual test-seeded keys for a normalized issuer (never crosses `by_binding` isolation boundaries, `SV-V2-01`).
     pub fn get_issuer_keys(&self, issuer: &str) -> Option<CachedIssuerKeys> {
         let norm = normalize_issuer(issuer);
         let guard = self.inner.read().ok()?;
-        guard.manual_by_issuer.get(&norm).cloned().or_else(|| {
-            guard
-                .by_binding
-                .values()
-                .find(|c| c.issuer == norm)
-                .cloned()
-        })
+        guard.manual_by_issuer.get(&norm).cloned()
     }
 
-    /// Check and atomically record an OIDC JWT `jti` claim inside the bounded anti-replay cache (`SV-AUD-03`).
+    /// Purge all cached JWKS keys and replay entries on vault seal (`SV-V2-06`).
+    pub fn clear_all(&self) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.by_binding.clear();
+            guard.manual_by_issuer.clear();
+            guard.consumed_jtis.clear();
+        }
+    }
+
+    /// Check and atomically record an OIDC JWT `jti` claim inside the bounded anti-replay cache (`SV-AUD-03`, `SV-V2-08`).
     pub fn check_and_record_jti(
         &self,
         normalized_issuer: &str,
@@ -352,14 +355,9 @@ impl OidcJwksCache {
         if guard.consumed_jtis.len() >= MAX_TRACKED_JTIS {
             guard.consumed_jtis.retain(|_, &mut exp| exp > now_unix);
             if guard.consumed_jtis.len() >= MAX_TRACKED_JTIS {
-                if let Some(oldest_key) = guard
-                    .consumed_jtis
-                    .iter()
-                    .min_by_key(|(_, &exp)| exp)
-                    .map(|(k, _)| k.clone())
-                {
-                    guard.consumed_jtis.remove(&oldest_key);
-                }
+                return Err(OidcError::DiscoveryFailed(
+                    "OIDC JTI anti-replay cache saturated; retry after token expiry".to_string(),
+                ));
             }
         }
         guard.consumed_jtis.insert(key, exp_unix);
@@ -520,6 +518,16 @@ pub fn is_disallowed_oidc_ip(ip: IpAddr, allow_loopback: bool, allow_private: bo
                 let hi = segs[6].to_be_bytes();
                 let lo = segs[7].to_be_bytes();
                 Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
+            } else if segs[0] == 0x2002 {
+                // RFC 3056 6to4 prefix (2002::/16) embeds IPv4 in segments 1 and 2 (`SV-V2-12`)
+                let hi = segs[1].to_be_bytes();
+                let lo = segs[2].to_be_bytes();
+                Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
+            } else if segs[0] == 0x2001 && segs[1] == 0x0000 {
+                // RFC 4380 Teredo prefix (2001:0000::/32) embeds XOR-inverted IPv4 in segments 6 and 7 (`SV-V2-12`)
+                let hi = (!segs[6]).to_be_bytes();
+                let lo = (!segs[7]).to_be_bytes();
+                Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
             } else {
                 None
             }
@@ -539,7 +547,11 @@ pub fn is_disallowed_oidc_ip(ip: IpAddr, allow_loopback: bool, allow_private: bo
         if ipv4.is_loopback() {
             return !allow_loopback;
         }
-        if ipv4.is_private() || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 0b0100_0000) {
+        if ipv4.is_private()
+            || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 0b0100_0000)
+            || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
+            || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
+        {
             return !allow_private;
         }
         return false;
@@ -699,7 +711,7 @@ async fn safe_get_json<T: serde::de::DeserializeOwned>(raw_url: &str) -> Result<
         .build()
         .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?;
 
-    let resp = client
+    let mut resp = client
         .get(&clean_url)
         .send()
         .await
@@ -717,14 +729,18 @@ async fn safe_get_json<T: serde::de::DeserializeOwned>(raw_url: &str) -> Result<
             ));
         }
     }
-    let bytes = resp
-        .bytes()
+    let mut bytes = Vec::with_capacity(8192);
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?;
-    if bytes.len() > MAX_OIDC_HTTP_RESPONSE_BYTES {
-        return Err(OidcError::DiscoveryFailed(
-            "OIDC response body exceeded 256 KiB safety limit".to_string(),
-        ));
+        .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_OIDC_HTTP_RESPONSE_BYTES {
+            return Err(OidcError::DiscoveryFailed(
+                "OIDC response body exceeded 256 KiB safety limit".to_string(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice::<T>(&bytes).map_err(|e| OidcError::DiscoveryFailed(e.to_string()))
 }
@@ -1159,11 +1175,24 @@ pub fn verify_oidc_jwt_and_resolve(
         .map_err(|_| OidcError::InvalidBase64)?;
     let signing_input = format!("{header_b64}.{payload_b64}");
 
+    let mut any_claim_matched = false;
     let mut any_keys_available = false;
     let mut any_kid_matched = false;
     let mut any_sig_verified = false;
 
     for binding in issuer_bindings {
+        // Evaluate fast claim predicates BEFORE expensive RSA/ECDSA signature verification (`SV-V2-08`)
+        if !jwt_audience_matches(&claims, &binding.audience) {
+            continue;
+        }
+        let Some(claim_val) = claims.get(&binding.subject_claim).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !claim_matches_pattern(claim_val, &binding.subject_pattern) {
+            continue;
+        }
+        any_claim_matched = true;
+
         // Resolve ONLY the keys trusted for this specific binding:
         let binding_keys: Vec<JwkKey> = match binding.inline_jwks_json.as_deref() {
             Some(inline) if !inline.trim().is_empty() => {
@@ -1202,40 +1231,35 @@ pub fn verify_oidc_jwt_and_resolve(
             }
         }
 
-        if !jwt_audience_matches(&claims, &binding.audience) {
-            continue;
+        if let Some(ref jti) = jti_opt {
+            cache.check_and_record_jti(&norm_iss, jti, exp, now_unix)?;
         }
-        let Some(claim_val) = claims.get(&binding.subject_claim).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if claim_matches_pattern(claim_val, &binding.subject_pattern) {
-            if let Some(ref jti) = jti_opt {
-                cache.check_and_record_jti(&norm_iss, jti, exp, now_unix)?;
-            }
-            let safe_sub: String = claim_val
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .take(48)
-                .collect();
+        let safe_sub: String = claim_val
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(48)
+            .collect();
 
-            return Ok(ScopedToken {
-                token_id: format!("oidc:{}:{}", binding.name, safe_sub),
-                token_hash_sha512: String::new(),
-                project: binding.project.clone(),
-                name: binding.name.clone(),
-                allowed_paths: binding.allowed_paths.clone(),
-                capabilities: binding.capabilities.clone(),
-                expires_at: Some(exp),
-            });
-        }
+        return Ok(ScopedToken {
+            token_id: format!("oidc:{}:{}", binding.name, safe_sub),
+            token_hash_sha512: String::new(),
+            project: binding.project.clone(),
+            name: binding.name.clone(),
+            allowed_paths: binding.allowed_paths.clone(),
+            capabilities: binding.capabilities.clone(),
+            expires_at: Some(exp),
+        });
     }
 
+    if !any_claim_matched {
+        return Err(OidcError::NoMatchingBinding(norm_iss));
+    }
     if !any_keys_available || !any_kid_matched {
         return Err(OidcError::SigningKeyNotFound(norm_iss, header.kid));
     }

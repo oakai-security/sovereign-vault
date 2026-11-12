@@ -18,6 +18,7 @@ use zeroize::Zeroizing;
 const DEFAULT_TELEMETRY_URL: &str = "https://telemetry.oakai-security.com/v1/ping";
 const DEFAULT_INTERVAL_SECS: u64 = 21_600; // 6 hours
 const SIEM_CHANNEL_CAPACITY: usize = 1024;
+const SIEM_HIGH_PRIORITY_RESERVE: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
@@ -42,8 +43,17 @@ pub struct SiemForwarder {
 
 impl SiemForwarder {
     /// Enqueue a tamper-evident HMAC-SHA512 chained audit event for asynchronous SIEM delivery.
-    /// Never blocks the caller (`try_send`).
+    /// Never blocks the caller (`try_send`). Reserves `SIEM_HIGH_PRIORITY_RESERVE` slots so
+    /// unauthenticated `auth.failed` / `auth.oidc.failed` noise cannot evict high-priority
+    /// secret read, mutation, or administrative events during webhook slowdowns.
     pub fn emit(&self, entry: AuditLogEntry) {
+        let is_low_priority = matches!(
+            entry.event_type.as_str(),
+            "auth.failed" | "auth.oidc.failed"
+        );
+        if is_low_priority && self.tx.capacity() <= SIEM_HIGH_PRIORITY_RESERVE {
+            return;
+        }
         let _ = self.tx.try_send(entry);
     }
 }
@@ -57,7 +67,7 @@ pub struct SiemAuditPayload {
 }
 
 /// Privacy-preserving operational heartbeat payload.
-/// Contains strictly aggregate counts — NEVER secret names, paths, tokens, or values.
+/// Contains strictly aggregate counts - NEVER secret names, paths, tokens, or values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TelemetryPing {
     pub cluster_id: String,

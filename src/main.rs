@@ -512,20 +512,36 @@ fn validate_env_var_name(raw: &str) -> Result<&str, String> {
             "Invalid environment variable name '{name}': must match [a-zA-Z_][a-zA-Z0-9_]*"
         ));
     }
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("LD_") || upper.starts_with("DYLD_") {
+        return Err(format!(
+            "Refusing to map secret onto privileged dynamic-linker variable '{name}'"
+        ));
+    }
     const BLOCKED_ENV_VARS: &[&str] = &[
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "LD_AUDIT",
         "BASH_ENV",
         "ENV",
-        "DYLD_INSERT_LIBRARIES",
+        "ZDOTDIR",
+        "PATH",
+        "CDPATH",
+        "IFS",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PROMPT_COMMAND",
+        "GCONV_PATH",
+        "HOSTALIASES",
+        "LOCPATH",
+        "NLSPATH",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "NODE_OPTIONS",
+        "PERL5OPT",
+        "RUBYOPT",
+        "JAVA_TOOL_OPTIONS",
     ];
-    if BLOCKED_ENV_VARS
-        .iter()
-        .any(|blocked| name.eq_ignore_ascii_case(blocked))
-    {
+    if BLOCKED_ENV_VARS.iter().any(|blocked| upper == *blocked) {
         return Err(format!(
-            "Refusing to map secret onto privileged dynamic-linker/shell variable '{name}'"
+            "Refusing to map secret onto privileged dynamic-linker/shell/runtime variable '{name}'"
         ));
     }
     Ok(name)
@@ -627,10 +643,11 @@ async fn resolve_tls_config(
                 #[cfg(unix)]
                 {
                     use std::io::Write;
-                    use std::os::unix::fs::OpenOptionsExt;
+                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
                     let mut opts = std::fs::OpenOptions::new();
                     opts.write(true).create(true).truncate(true).mode(0o600);
                     let mut f = opts.open(&key_file)?;
+                    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                     f.write_all(key_pem.as_bytes())?;
                 }
                 #[cfg(not(unix))]
@@ -708,6 +725,27 @@ fn read_secret_value_input(prompt: &str, from_stdin: bool) -> Result<Zeroizing<S
     }
 }
 
+fn verify_secret_file_permissions(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("Failed inspecting token file {:?}: {e}", path))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o077) != 0 {
+            return Err(format!(
+                "Refusing to load token from {:?} with insecure permissions {:04o}; file must not be accessible by group or others (expected 0600 or 0400)",
+                path, mode
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 fn resolve_caller_token(from_stdin: bool) -> Result<Zeroizing<String>, String> {
     resolve_caller_token_with_file(from_stdin, None)
 }
@@ -720,6 +758,7 @@ fn resolve_caller_token_with_file(
         return read_secret_input("", true);
     }
     if let Some(path) = token_file {
+        verify_secret_file_permissions(path)?;
         let raw = Zeroizing::new(
             std::fs::read_to_string(path)
                 .map_err(|e| format!("Failed reading token file {:?}: {e}", path))?,
@@ -732,6 +771,7 @@ fn resolve_caller_token_with_file(
     if let Ok(file_env) = std::env::var("VAULT_TOKEN_FILE") {
         let p = PathBuf::from(file_env.trim());
         if p.is_file() {
+            verify_secret_file_permissions(&p)?;
             let raw = Zeroizing::new(
                 std::fs::read_to_string(&p)
                     .map_err(|e| format!("Failed reading VAULT_TOKEN_FILE {:?}: {e}", p))?,
@@ -1165,10 +1205,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(unix)]
             {
                 use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
                 let mut opts = std::fs::OpenOptions::new();
                 opts.write(true).create(true).truncate(true).mode(0o600);
                 let mut f = opts.open(&output)?;
+                f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                 f.write_all(dotenv_buf.as_bytes())?;
             }
             #[cfg(not(unix))]
@@ -1245,10 +1286,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     #[cfg(unix)]
                     {
                         use std::io::Write;
-                        use std::os::unix::fs::OpenOptionsExt;
+                        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
                         let mut opts = std::fs::OpenOptions::new();
                         opts.write(true).create(true).truncate(true).mode(0o600);
                         let mut f = opts.open(&out_path)?;
+                        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
                         f.write_all(enrolled.token.as_bytes())?;
                     }
                     #[cfg(not(unix))]
@@ -1482,7 +1524,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if raw {
                     print!("{}", secret.value);
                 } else {
-                    println!("{}", serde_json::to_string_pretty(&secret)?);
+                    let formatted = Zeroizing::new(serde_json::to_string_pretty(&secret)?);
+                    println!("{}", formatted.as_str());
                 }
             }
 
@@ -1554,7 +1597,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!(
                                 "Vault detected in SEALED state; retrieving key via OS Secret Service..."
                             );
-                            let out = Command::new("sh").arg("-c").arg(&key_cmd).output();
+                            let out = Command::new("sh")
+                                .arg("-c")
+                                .arg(&key_cmd)
+                                .env_remove("VAULT_TOKEN")
+                                .env_remove("VAULT_TOKEN_FILE")
+                                .output();
                             match out {
                                 Ok(mut o) if o.status.success() => {
                                     let key_str = Zeroizing::new(
@@ -1645,7 +1693,29 @@ mod tests {
         assert!(validate_env_var_name("LD_PRELOAD").is_err());
         assert!(validate_env_var_name("ld_preload").is_err());
         assert!(validate_env_var_name("LD_LIBRARY_PATH").is_err());
+        assert!(validate_env_var_name("LD_DEBUG_OUTPUT").is_err());
         assert!(validate_env_var_name("BASH_ENV").is_err());
         assert!(validate_env_var_name("DYLD_INSERT_LIBRARIES").is_err());
+        assert!(validate_env_var_name("DYLD_FRAMEWORK_PATH").is_err());
+        assert!(validate_env_var_name("PATH").is_err());
+        assert!(validate_env_var_name("IFS").is_err());
+        assert!(validate_env_var_name("PYTHONPATH").is_err());
+        assert!(validate_env_var_name("NODE_OPTIONS").is_err());
+        assert!(validate_env_var_name("JAVA_TOOL_OPTIONS").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_verify_secret_file_permissions_rejects_group_or_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let tok_file = dir.path().join("vault.token");
+        std::fs::write(&tok_file, "sv_live_test_secret\n").unwrap();
+
+        std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(super::verify_secret_file_permissions(&tok_file).is_err());
+
+        std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(super::verify_secret_file_permissions(&tok_file).is_ok());
     }
 }
