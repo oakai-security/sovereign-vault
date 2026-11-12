@@ -141,6 +141,26 @@ pub fn write_envelope_header(data_dir: &Path, header: &EnvelopeHeader) -> Result
     Ok(())
 }
 
+/// Re-persist a rotated `EnvelopeHeader` across all retained backup snapshots on `/data/backups/`
+/// (`SV-AUD-02`), ensuring a rotated unseal key can no longer unwrap `master_dek` from older snapshots.
+pub fn update_backup_envelopes(
+    data_dir: &Path,
+    new_header: &EnvelopeHeader,
+) -> Result<(), StorageError> {
+    let backups_root = data_dir.join("backups");
+    if !backups_root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&backups_root)? {
+        let entry = entry?;
+        let snap_dir = entry.path();
+        if snap_dir.is_dir() && envelope_path(&snap_dir).is_file() {
+            write_envelope_header(&snap_dir, new_header)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn read_envelope_header(data_dir: &Path) -> Result<EnvelopeHeader, StorageError> {
     let bytes = fs::read(envelope_path(data_dir))?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -163,15 +183,52 @@ fn write_audit_anchor(
     data_dir: &Path,
     audit_key: &LockedKey,
     seq: i64,
+    prev_mac_sha512: &str,
     entry_mac_sha512: &str,
 ) -> Result<(), StorageError> {
+    let final_path = audit_anchor_path(data_dir);
+    // SV-AUD-01: Verify continuity with the existing anchor before overwriting so that
+    // a truncated or wiped `audit_log` (or deleted anchor file) can NEVER be silently re-anchored
+    // by a subsequent `sys.unseal`, `auth.failed`, or data event.
+    if final_path.exists() {
+        match read_audit_anchor(data_dir) {
+            Ok(Some(existing)) => {
+                let expected_existing_mac =
+                    compute_anchor_mac(audit_key, existing.seq, &existing.entry_mac_sha512);
+                let anchor_authentic =
+                    constant_time_str_eq(&existing.anchor_mac_sha512, &expected_existing_mac);
+                let chain_continuous = existing.seq + 1 == seq
+                    && constant_time_str_eq(&existing.entry_mac_sha512, prev_mac_sha512);
+                if !anchor_authentic || !chain_continuous {
+                    tracing::error!(
+                        anchor_seq = existing.seq,
+                        new_seq = seq,
+                        "Audit chain continuity violation: refusing to overwrite high-water audit anchor"
+                    );
+                    return Ok(());
+                }
+            }
+            Ok(None) | Err(_) => {
+                tracing::error!(
+                    "Corrupt vault.audit_anchor detected: refusing to overwrite tamper state"
+                );
+                return Ok(());
+            }
+        }
+    } else if seq != 1 || !constant_time_str_eq(prev_mac_sha512, AUDIT_GENESIS_MAC) {
+        tracing::error!(
+            new_seq = seq,
+            "Missing vault.audit_anchor for non-genesis audit event: refusing to recreate anchor"
+        );
+        return Ok(());
+    }
+
     let anchor = AuditChainAnchor {
         seq,
         entry_mac_sha512: entry_mac_sha512.to_string(),
         anchor_mac_sha512: compute_anchor_mac(audit_key, seq, entry_mac_sha512),
     };
     let tmp_path = data_dir.join("vault.audit_anchor.tmp");
-    let final_path = audit_anchor_path(data_dir);
     let payload = serde_json::to_vec(&anchor)?;
 
     let mut file = fs::File::create(&tmp_path)?;
@@ -218,6 +275,7 @@ fn set_mode_0600(path: &Path) -> std::io::Result<()> {
 
 fn append_audit_in_tx(
     tx: &Transaction<'_>,
+    data_dir: &Path,
     audit_key: &LockedKey,
     event_type: &str,
     actor: &str,
@@ -247,6 +305,10 @@ fn append_audit_in_tx(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
     )?;
+
+    // SV-AUD-10: Persist anchor inside the transaction scope before tx.commit() so any disk I/O
+    // failure rolls back the SQLite transaction rather than leaving vault.db and anchor out of sync.
+    write_audit_anchor(data_dir, audit_key, seq, &prev_mac, &entry_mac)?;
 
     Ok(AuditLogEntry {
         seq,
@@ -402,9 +464,16 @@ impl Storage {
                  updated_at = excluded.updated_at",
             params![path, project, version, ciphertext, nonce.as_slice(), now],
         )?;
-        let entry = append_audit_in_tx(&tx, audit_key, "secret.put", actor, path, &outcome)?;
+        let entry = append_audit_in_tx(
+            &tx,
+            &self.data_dir,
+            audit_key,
+            "secret.put",
+            actor,
+            path,
+            &outcome,
+        )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(entry)
     }
 
@@ -505,9 +574,16 @@ impl Storage {
         if affected == 0 {
             return Ok(None);
         }
-        let entry = append_audit_in_tx(&tx, audit_key, "secret.delete", actor, path, "deleted")?;
+        let entry = append_audit_in_tx(
+            &tx,
+            &self.data_dir,
+            audit_key,
+            "secret.delete",
+            actor,
+            path,
+            "deleted",
+        )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(Some(entry))
     }
 
@@ -583,9 +659,16 @@ impl Storage {
                 now
             ],
         )?;
-        let entry = append_audit_in_tx(&tx, audit_key, "token.enroll", actor, token_id, "created")?;
+        let entry = append_audit_in_tx(
+            &tx,
+            &self.data_dir,
+            audit_key,
+            "token.enroll",
+            actor,
+            token_id,
+            "created",
+        )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(entry)
     }
 
@@ -639,10 +722,16 @@ impl Storage {
         if affected == 0 {
             return Ok(None);
         }
-        let entry =
-            append_audit_in_tx(&tx, audit_key, "token.revoke", actor, token_id, "revoked")?;
+        let entry = append_audit_in_tx(
+            &tx,
+            &self.data_dir,
+            audit_key,
+            "token.revoke",
+            actor,
+            token_id,
+            "revoked",
+        )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(Some(entry))
     }
 
@@ -697,6 +786,7 @@ impl Storage {
         )?;
         let entry = append_audit_in_tx(
             &tx,
+            &self.data_dir,
             audit_key,
             "oidc.binding.enroll",
             actor,
@@ -704,7 +794,6 @@ impl Storage {
             "created",
         )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(entry)
     }
 
@@ -824,6 +913,7 @@ impl Storage {
         }
         let entry = append_audit_in_tx(
             &tx,
+            &self.data_dir,
             audit_key,
             "oidc.binding.revoke",
             actor,
@@ -831,7 +921,6 @@ impl Storage {
             "revoked",
         )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(Some(entry))
     }
 
@@ -944,9 +1033,16 @@ impl Storage {
         outcome: &str,
     ) -> Result<AuditLogEntry, StorageError> {
         let tx = self.conn.transaction()?;
-        let entry = append_audit_in_tx(&tx, audit_key, event_type, actor, resource, outcome)?;
+        let entry = append_audit_in_tx(
+            &tx,
+            &self.data_dir,
+            audit_key,
+            event_type,
+            actor,
+            resource,
+            outcome,
+        )?;
         tx.commit()?;
-        write_audit_anchor(&self.data_dir, audit_key, entry.seq, &entry.entry_mac_sha512)?;
         Ok(entry)
     }
 
@@ -1049,11 +1145,40 @@ impl Storage {
 
     /// Perform an online encrypted backup by verifying non-busy WAL checkpoint truncation,
     /// copying `vault.db` + `vault.envelope` (+ `vault.audit_anchor` if present) into a `0700`/`0600`
-    /// snapshot directory, and computing a cryptographic SHA-256 digest of the snapshot.
+    /// snapshot directory, and computing a length-framed streaming SHA-256 digest of the snapshot (`SV-AUD-14`).
     pub fn create_encrypted_backup(&self) -> Result<BackupMetadata, StorageError> {
-        let busy_flag: i64 =
-            self.conn
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        let now = now_unix_seconds();
+        let mut suffix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut suffix);
+        let snapshot_id = format!("snap_{}_{}", now, hex_encode(suffix));
+        self.create_encrypted_backup_with_id(&snapshot_id)
+    }
+
+    /// Perform an online encrypted backup after recording `sys.backup` so the snapshot itself
+    /// includes its creation audit record and synchronized `vault.audit_anchor` (`SV-AUD-14`).
+    pub fn create_encrypted_backup_audited(
+        &mut self,
+        audit_key: &LockedKey,
+        actor: &str,
+    ) -> Result<(BackupMetadata, AuditLogEntry), StorageError> {
+        let now = now_unix_seconds();
+        let mut suffix = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut suffix);
+        let snapshot_id = format!("snap_{}_{}", now, hex_encode(suffix));
+
+        let entry =
+            self.append_audit_event(audit_key, "sys.backup", actor, &snapshot_id, "created")?;
+        let meta = self.create_encrypted_backup_with_id(&snapshot_id)?;
+        Ok((meta, entry))
+    }
+
+    fn create_encrypted_backup_with_id(
+        &self,
+        snapshot_id: &str,
+    ) -> Result<BackupMetadata, StorageError> {
+        let busy_flag: i64 = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
         if busy_flag != 0 {
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -1061,40 +1186,37 @@ impl Storage {
             )));
         }
 
-        let now = now_unix_seconds();
-        let mut suffix = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut suffix);
-        let snapshot_id = format!("snap_{}_{}", now, hex_encode(suffix));
-
         let backups_root = self.data_dir.join("backups");
         ensure_secure_dir(&backups_root)?;
-        let snap_dir = backups_root.join(&snapshot_id);
+        let snap_dir = backups_root.join(snapshot_id);
         ensure_secure_dir(&snap_dir)?;
 
         let dst_db = snap_dir.join(DB_FILENAME);
         let dst_env = snap_dir.join(ENVELOPE_FILENAME);
 
-        let db_bytes = copy_file_0600_synced(&self.db_path, &dst_db)?;
-        let env_bytes = copy_file_0600_synced(&envelope_path(&self.data_dir), &dst_env)?;
+        let mut hasher = Sha256::new();
+        let db_bytes = copy_and_hash_file_0600_synced(&self.db_path, &dst_db, &mut hasher)?;
+        let env_bytes =
+            copy_and_hash_file_0600_synced(&envelope_path(&self.data_dir), &dst_env, &mut hasher)?;
 
         let anchor_src = audit_anchor_path(&self.data_dir);
         let anchor_bytes = if anchor_src.is_file() {
-            copy_file_0600_synced(&anchor_src, &snap_dir.join(AUDIT_ANCHOR_FILENAME))?
+            copy_and_hash_file_0600_synced(
+                &anchor_src,
+                &snap_dir.join(AUDIT_ANCHOR_FILENAME),
+                &mut hasher,
+            )?
         } else {
+            hasher.update(0u64.to_be_bytes());
             0
         };
 
-        let db_raw = fs::read(&dst_db)?;
-        let env_raw = fs::read(&dst_env)?;
-        let mut hasher = Sha256::new();
-        hasher.update(&db_raw);
-        hasher.update(&env_raw);
         let sha256 = hex_encode(hasher.finalize());
 
         prune_excess_backups(&backups_root, MAX_BACKUP_SNAPSHOTS);
 
         Ok(BackupMetadata {
-            snapshot_id,
+            snapshot_id: snapshot_id.to_string(),
             backup_dir: snap_dir.to_string_lossy().to_string(),
             total_bytes: db_bytes + env_bytes + anchor_bytes,
             sha256,
@@ -1102,11 +1224,30 @@ impl Storage {
     }
 }
 
-fn copy_file_0600_synced(src: &Path, dst: &Path) -> std::io::Result<u64> {
+fn copy_and_hash_file_0600_synced(
+    src: &Path,
+    dst: &Path,
+    hasher: &mut Sha256,
+) -> std::io::Result<u64> {
+    use std::io::Read;
     let mut src_file = fs::File::open(src)?;
+    let file_len = src_file.metadata()?.len();
+    hasher.update(file_len.to_be_bytes());
+
     let mut dst_file = fs::File::create(dst)?;
     set_mode_0600(dst)?;
-    let copied = std::io::copy(&mut src_file, &mut dst_file)?;
+
+    let mut buf = [0u8; 16 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = src_file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst_file.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        copied += n as u64;
+    }
     dst_file.flush()?;
     dst_file.sync_all()?;
     Ok(copied)

@@ -25,8 +25,8 @@ use crate::oidc::{
 };
 use crate::storage::{
     audit_anchor_path, database_path, envelope_path, has_partial_initialization,
-    is_vault_initialized, now_unix_seconds, read_envelope_header, write_envelope_header,
-    AuditLogEntry, SecretMetadataItem, Storage, TokenMetadataItem,
+    is_vault_initialized, now_unix_seconds, read_envelope_header, update_backup_envelopes,
+    write_envelope_header, AuditLogEntry, SecretMetadataItem, Storage, TokenMetadataItem,
 };
 use crate::telemetry::SiemForwarder;
 use axum::{
@@ -178,8 +178,12 @@ impl AppState {
                     !q.is_empty()
                 });
                 if guard.len() >= MAX_TRACKED_RATE_LIMIT_IPS {
-                    if let Some(&arbitrary_ip) = guard.keys().next() {
-                        guard.remove(&arbitrary_ip);
+                    if let Some(oldest_ip) = guard
+                        .iter()
+                        .min_by_key(|(_, q)| q.back().copied())
+                        .map(|(&ip, _)| ip)
+                    {
+                        guard.remove(&oldest_ip);
                     }
                 }
             }
@@ -224,7 +228,7 @@ pub struct HealthResponse {
     pub version: String,
 }
 
-#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct UnsealRequest {
     pub unseal_key: String,
 }
@@ -241,7 +245,7 @@ pub struct InitVaultResponse {
     pub warning: String,
 }
 
-#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct RotateUnsealKeyRequest {
     pub current_unseal_key: String,
 }
@@ -271,7 +275,7 @@ pub struct GetSecretQuery {
     pub version: Option<i64>,
 }
 
-#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct PutSecretRequest {
     #[zeroize(skip)]
     pub project: String,
@@ -639,29 +643,28 @@ fn authenticate_caller(
             );
             return Err(api_err(
                 StatusCode::UNAUTHORIZED,
-                "Unknown or revoked machine token",
+                "Invalid or expired machine token",
             ));
         }
     };
 
-    if !verify_token_sha512_ct(&candidate_secret, &tok.token_hash_sha512) {
+    let secret_valid = verify_token_sha512_ct(&candidate_secret, &tok.token_hash_sha512);
+    let now = now_unix_seconds();
+    let is_expired = tok.expires_at.map(|exp| now >= exp).unwrap_or(false);
+
+    if !secret_valid || is_expired {
         state.check_token_rate_limit_ip(peer_ip)?;
         state.record_token_auth_failure_ip(peer_ip);
-        record_audit(active, "auth.failed", &token_id, "sys/auth", "bad_secret");
-        return Err(api_err(StatusCode::UNAUTHORIZED, "Invalid machine token"));
-    }
-
-    let now = now_unix_seconds();
-    if let Some(exp) = tok.expires_at {
-        if now >= exp {
-            state.check_token_rate_limit_ip(peer_ip)?;
-            state.record_token_auth_failure_ip(peer_ip);
-            record_audit(active, "auth.failed", &token_id, "sys/auth", "expired");
-            return Err(api_err(
-                StatusCode::UNAUTHORIZED,
-                "Machine token has expired",
-            ));
-        }
+        let outcome = if !secret_valid {
+            "bad_secret"
+        } else {
+            "expired"
+        };
+        record_audit(active, "auth.failed", &token_id, "sys/auth", outcome);
+        return Err(api_err(
+            StatusCode::UNAUTHORIZED,
+            "Invalid or expired machine token",
+        ));
     }
 
     Ok(tok)
@@ -753,6 +756,8 @@ async fn init_handler(
     let db_locked = db_key.is_memory_locked();
     let mut storage = Storage::open_encrypted(&state.data_dir, &db_key).map_err(|_| {
         let _ = std::fs::remove_file(database_path(&state.data_dir));
+        let _ = std::fs::remove_file(state.data_dir.join("vault.db-wal"));
+        let _ = std::fs::remove_file(state.data_dir.join("vault.db-shm"));
         api_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to initialize SQLCipher DB",
@@ -791,6 +796,8 @@ async fn init_handler(
     {
         drop(storage);
         let _ = std::fs::remove_file(database_path(&state.data_dir));
+        let _ = std::fs::remove_file(state.data_dir.join("vault.db-wal"));
+        let _ = std::fs::remove_file(state.data_dir.join("vault.db-shm"));
         let _ = std::fs::remove_file(envelope_path(&state.data_dir));
         let _ = std::fs::remove_file(audit_anchor_path(&state.data_dir));
         return Err(api_err(
@@ -943,9 +950,7 @@ async fn rotate_unseal_key_handler(
     headers: HeaderMap,
     Json(payload): Json<RotateUnsealKeyRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    state.check_rate_limit_ip(peer_ip)?;
-
-    let active_guard = state.active.write().await;
+    let active_guard = state.active.read().await;
     let active = active_guard
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
@@ -965,13 +970,15 @@ async fn rotate_unseal_key_handler(
         ));
     }
 
-    let decoded =
-        Zeroizing::new(
-            hex_decode(payload.current_unseal_key.trim()).map_err(|_| {
-                state.record_auth_failure_ip(peer_ip);
-                api_err(StatusCode::BAD_REQUEST, "Invalid hex-encoded current_unseal_key")
-            })?,
-        );
+    state.check_rate_limit_ip(peer_ip)?;
+
+    let decoded = Zeroizing::new(hex_decode(payload.current_unseal_key.trim()).map_err(|_| {
+        state.record_auth_failure_ip(peer_ip);
+        api_err(
+            StatusCode::BAD_REQUEST,
+            "Invalid hex-encoded current_unseal_key",
+        )
+    })?);
     if decoded.len() != 32 {
         state.record_auth_failure_ip(peer_ip);
         return Err(api_err(
@@ -983,45 +990,67 @@ async fn rotate_unseal_key_handler(
     let mut cur_key_arr = Zeroizing::new([0u8; 32]);
     cur_key_arr.copy_from_slice(&decoded);
 
-    let current_header = read_envelope_header(&state.data_dir).map_err(|_| {
-        api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to read vault envelope",
-        )
-    })?;
+    // Serialize envelope read + re-wrap + audit persistence under the storage mutex
+    let (new_unseal_key, entry) = {
+        let mut db = active
+            .storage
+            .lock()
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
 
-    let (new_unseal_key, new_header) =
-        rotate_envelope_unseal_key(&cur_key_arr, &current_header).map_err(|_| {
-            state.record_auth_failure_ip(peer_ip);
-            record_audit(
-                active,
-                "sys.rotate_unseal_key.failed",
-                &caller.token_id,
-                "sys/envelope",
-                "invalid_unseal_key",
-            );
+        let current_header = read_envelope_header(&state.data_dir).map_err(|_| {
             api_err(
-                StatusCode::UNAUTHORIZED,
-                "Current unseal key verification failed",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to read vault envelope",
             )
         })?;
 
-    write_envelope_header(&state.data_dir, &new_header).map_err(|_| {
-        api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to atomically persist rotated vault envelope",
-        )
-    })?;
+        let (new_unseal_key, new_header) =
+            rotate_envelope_unseal_key(&cur_key_arr, &current_header).map_err(|_| {
+                state.record_auth_failure_ip(peer_ip);
+                let _ = db.append_audit_event(
+                    &active.audit_chain_key,
+                    "sys.rotate_unseal_key.failed",
+                    &caller.token_id,
+                    "sys/envelope",
+                    "invalid_unseal_key",
+                );
+                api_err(
+                    StatusCode::UNAUTHORIZED,
+                    "Current unseal key verification failed",
+                )
+            })?;
 
-    if let Err(e) = record_audit_strict(
-        active,
-        "sys.rotate_unseal_key",
-        &caller.token_id,
-        "sys/envelope",
-        "rotated",
-    ) {
-        let _ = write_envelope_header(&state.data_dir, &current_header);
-        return Err(e);
+        write_envelope_header(&state.data_dir, &new_header).map_err(|_| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to atomically persist rotated vault envelope",
+            )
+        })?;
+
+        match db.append_audit_event(
+            &active.audit_chain_key,
+            "sys.rotate_unseal_key",
+            &caller.token_id,
+            "sys/envelope",
+            "rotated",
+        ) {
+            Ok(audit_entry) => {
+                // Re-wrap any local backup snapshots in /data/backups/ so revoked unseal keys
+                // cannot unwrap historical local snapshot envelopes (`SV-AUD-02`).
+                let _ = update_backup_envelopes(&state.data_dir, &new_header);
+                (new_unseal_key, audit_entry)
+            }
+            Err(_) => {
+                let _ = write_envelope_header(&state.data_dir, &current_header);
+                return Err(api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to persist audit event for unseal key rotation",
+                ));
+            }
+        }
+    };
+    if let Some(ref forwarder) = active.siem_forwarder {
+        forwarder.emit(entry);
     }
 
     let new_unseal_hex = Zeroizing::new(hex_encode(new_unseal_key.as_ref()));
@@ -1472,27 +1501,34 @@ async fn seal_handler(
     PeerIp(peer_ip): PeerIp,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    let caller_id = {
+        let active_guard = state.active.read().await;
+        let active = active_guard
+            .as_ref()
+            .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is already sealed"))?;
+
+        let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
+        if !caller.is_admin(now_unix_seconds()) {
+            record_audit(
+                active,
+                "acl.denied",
+                &caller.token_id,
+                "sys/seal",
+                "forbidden",
+            );
+            return Err(api_err(
+                StatusCode::FORBIDDEN,
+                "Admin capability required to seal vault",
+            ));
+        }
+        caller.token_id
+    };
+
     let mut active_guard = state.active.write().await;
     let active = active_guard
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is already sealed"))?;
 
-    let caller = authenticate_caller(&state, active, &headers, peer_ip)?;
-    if !caller.is_admin(now_unix_seconds()) {
-        record_audit(
-            active,
-            "acl.denied",
-            &caller.token_id,
-            "sys/seal",
-            "forbidden",
-        );
-        return Err(api_err(
-            StatusCode::FORBIDDEN,
-            "Admin capability required to seal vault",
-        ));
-    }
-
-    let caller_id = caller.token_id.clone();
     record_audit_strict(active, "sys.seal", &caller_id, "sys/vault", "sealed")?;
     *active_guard = None;
     drop(active_guard);
@@ -1536,24 +1572,8 @@ async fn backup_handler(
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        let m = db
-            .create_encrypted_backup()
-            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encrypted backup failed"))?;
-        let audit_entry = db
-            .append_audit_event(
-                &active.audit_chain_key,
-                "sys.backup",
-                &caller.token_id,
-                &m.snapshot_id,
-                "created",
-            )
-            .map_err(|_| {
-                api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to persist backup audit event",
-                )
-            })?;
-        (m, audit_entry)
+        db.create_encrypted_backup_audited(&active.audit_chain_key, &caller.token_id)
+            .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Encrypted backup failed"))?
     };
     if let Some(ref forwarder) = active.siem_forwarder {
         forwarder.emit(entry);
@@ -1749,10 +1769,22 @@ async fn enroll_handler(
     validate_capabilities(&payload.capabilities)
         .map_err(|msg| api_err(StatusCode::BAD_REQUEST, msg))?;
 
-    let expires_at = payload
-        .ttl_seconds
-        .filter(|&ttl| ttl > 0)
-        .map(|ttl| now.saturating_add(ttl as i64));
+    let expires_at = match payload.ttl_seconds {
+        None => None,
+        Some(0) => {
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                "ttl_seconds must be greater than 0 (omit ttl_seconds for a non-expiring token)",
+            ));
+        }
+        Some(ttl) if ttl > 315_360_000 => {
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                "ttl_seconds cannot exceed 315360000 (10 years)",
+            ));
+        }
+        Some(ttl) => Some(now.saturating_add(ttl as i64)),
+    };
 
     let (token_id, raw_token, token_hash_sha512) = mint_machine_token();
 
@@ -1836,17 +1868,13 @@ async fn revoke_token_handler(
             .storage
             .lock()
             .map_err(|_| api_err(StatusCode::INTERNAL_SERVER_ERROR, "Storage lock error"))?;
-        db.delete_token_audited(
-            &target_token_id,
-            &active.audit_chain_key,
-            &caller.token_id,
-        )
-        .map_err(|_| {
-            api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Token deletion or audit persistence failed",
-            )
-        })?
+        db.delete_token_audited(&target_token_id, &active.audit_chain_key, &caller.token_id)
+            .map_err(|_| {
+                api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Token deletion or audit persistence failed",
+                )
+            })?
     };
 
     let Some(entry) = maybe_entry else {

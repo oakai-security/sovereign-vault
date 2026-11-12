@@ -23,8 +23,12 @@ use thiserror::Error;
 pub const DEFAULT_JWKS_REFRESH_INTERVAL_SECS: u64 = 900;
 /// Maximum allowed clock skew when validating `nbf` / `iat` claims (30 seconds).
 const CLOCK_SKEW_LEEWAY_SECS: i64 = 30;
-/// Maximum accepted OIDC JWT validity window (`exp - iat`): 24 hours.
+/// Maximum accepted OIDC JWT validity window (`exp - iat` and `exp - now`): 24 hours.
 const MAX_OIDC_TOKEN_LIFETIME_SECS: i64 = 86_400;
+/// Maximum outbound OIDC Discovery / JWKS HTTP response size (256 KiB, `SV-AUD-05`).
+const MAX_OIDC_HTTP_RESPONSE_BYTES: usize = 256 * 1024;
+/// Maximum tracked `jti` anti-replay entries in RAM (`SV-AUD-03`).
+const MAX_TRACKED_JTIS: usize = 16_384;
 
 #[derive(Debug, Error)]
 pub enum OidcError {
@@ -42,6 +46,8 @@ pub enum OidcError {
     TokenExpired(i64, i64),
     #[error("JWT is not yet valid or exceeds max token lifetime (claim={0}, now={1})")]
     TokenNotYetValid(i64, i64),
+    #[error("JWT jti replay detected (jti='{0}' already consumed)")]
+    TokenReplayed(String),
     #[error("Untrusted OIDC issuer '{0}' (no matching OIDC binding configured)")]
     UntrustedIssuer(String),
     #[error("No matching JWKS public key found for issuer '{0}' (kid={1:?})")]
@@ -245,6 +251,7 @@ pub struct CachedIssuerKeys {
 struct CacheStore {
     by_binding: HashMap<String, CachedIssuerKeys>,
     manual_by_issuer: HashMap<String, CachedIssuerKeys>,
+    consumed_jtis: HashMap<(String, String), i64>,
 }
 
 /// Thread-safe in-memory OIDC JWKS cache isolated by `binding_id` to prevent cross-project
@@ -315,11 +322,48 @@ impl OidcJwksCache {
     pub fn get_issuer_keys(&self, issuer: &str) -> Option<CachedIssuerKeys> {
         let norm = normalize_issuer(issuer);
         let guard = self.inner.read().ok()?;
-        guard
-            .manual_by_issuer
-            .get(&norm)
-            .cloned()
-            .or_else(|| guard.by_binding.values().find(|c| c.issuer == norm).cloned())
+        guard.manual_by_issuer.get(&norm).cloned().or_else(|| {
+            guard
+                .by_binding
+                .values()
+                .find(|c| c.issuer == norm)
+                .cloned()
+        })
+    }
+
+    /// Check and atomically record an OIDC JWT `jti` claim inside the bounded anti-replay cache (`SV-AUD-03`).
+    pub fn check_and_record_jti(
+        &self,
+        normalized_issuer: &str,
+        jti: &str,
+        exp_unix: i64,
+        now_unix: i64,
+    ) -> Result<(), OidcError> {
+        let mut guard = self
+            .inner
+            .write()
+            .map_err(|_| OidcError::DiscoveryFailed("JWKS cache lock poisoned".to_string()))?;
+        let key = (normalized_issuer.to_string(), jti.to_string());
+        if let Some(&existing_exp) = guard.consumed_jtis.get(&key) {
+            if existing_exp > now_unix {
+                return Err(OidcError::TokenReplayed(jti.to_string()));
+            }
+        }
+        if guard.consumed_jtis.len() >= MAX_TRACKED_JTIS {
+            guard.consumed_jtis.retain(|_, &mut exp| exp > now_unix);
+            if guard.consumed_jtis.len() >= MAX_TRACKED_JTIS {
+                if let Some(oldest_key) = guard
+                    .consumed_jtis
+                    .iter()
+                    .min_by_key(|(_, &exp)| exp)
+                    .map(|(k, _)| k.clone())
+                {
+                    guard.consumed_jtis.remove(&oldest_key);
+                }
+            }
+        }
+        guard.consumed_jtis.insert(key, exp_unix);
+        Ok(())
     }
 
     /// Refresh all bindings in `bindings` with strict per-`binding_id` isolation, deduplicating
@@ -462,7 +506,24 @@ fn env_flag_enabled(var_name: &str) -> bool {
 pub fn is_disallowed_oidc_ip(ip: IpAddr, allow_loopback: bool, allow_private: bool) -> bool {
     let v4 = match ip {
         IpAddr::V4(v4) => Some(v4),
-        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            // SV-AUD-05: Extract embedded IPv4 from ::ffff:0:0/96, IPv4-compatible ::a.b.c.d,
+            // or RFC 6052 / RFC 8215 NAT64 prefixes (64:ff9b::/96 and 64:ff9b:1::/48).
+            if let Some(mapped) = v6.to_ipv4() {
+                if !v6.is_unspecified() && !v6.is_loopback() {
+                    Some(mapped)
+                } else {
+                    None
+                }
+            } else if segs[0] == 0x0064 && segs[1] == 0xff9b && (segs[2] == 0 || segs[2] == 1) {
+                let hi = segs[6].to_be_bytes();
+                let lo = segs[7].to_be_bytes();
+                Some(Ipv4Addr::new(hi[0], hi[1], lo[0], lo[1]))
+            } else {
+                None
+            }
+        }
     };
 
     if let Some(ipv4) = v4 {
@@ -519,7 +580,9 @@ pub fn parse_and_validate_oidc_url(
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || c == '#' || c == '@')
     {
-        return Err("OIDC URL must not contain whitespace, control characters, fragments, or userinfo");
+        return Err(
+            "OIDC URL must not contain whitespace, control characters, fragments, or userinfo",
+        );
     }
 
     let (is_https, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
@@ -544,7 +607,11 @@ pub fn parse_and_validate_oidc_url(
                 .parse::<u16>()
                 .map_err(|_| "Invalid port in OIDC URL")?
         } else if rem.is_empty() {
-            if is_https { 443 } else { 80 }
+            if is_https {
+                443
+            } else {
+                80
+            }
         } else {
             return Err("Invalid authority suffix in OIDC URL");
         };
@@ -643,9 +710,23 @@ async fn safe_get_json<T: serde::de::DeserializeOwned>(raw_url: &str) -> Result<
             resp.status().as_u16()
         )));
     }
-    resp.json::<T>()
+    if let Some(len) = resp.content_length() {
+        if len > MAX_OIDC_HTTP_RESPONSE_BYTES as u64 {
+            return Err(OidcError::DiscoveryFailed(
+                "OIDC response Content-Length exceeded 256 KiB safety limit".to_string(),
+            ));
+        }
+    }
+    let bytes = resp
+        .bytes()
         .await
-        .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))
+        .map_err(|e| OidcError::DiscoveryFailed(e.to_string()))?;
+    if bytes.len() > MAX_OIDC_HTTP_RESPONSE_BYTES {
+        return Err(OidcError::DiscoveryFailed(
+            "OIDC response body exceeded 256 KiB safety limit".to_string(),
+        ));
+    }
+    serde_json::from_slice::<T>(&bytes).map_err(|e| OidcError::DiscoveryFailed(e.to_string()))
 }
 
 async fn fetch_remote_jwks(
@@ -680,9 +761,11 @@ pub fn normalize_issuer(iss: &str) -> String {
     iss.trim().trim_end_matches('/').to_string()
 }
 
-/// Validate a subject/claim string against a binding pattern.
+/// Validate a subject/claim string against a binding pattern with full backtracking (`SV-AUD-06`).
+/// Interior wildcards immediately followed by `:` (`*:`) do not match across `:` hierarchy delimiters,
+/// preventing cross-field claim injection while trailing `*` continues to match arbitrary suffixes.
 pub fn claim_matches_pattern(value: &str, pattern: &str) -> bool {
-    if value.is_empty() {
+    if value.is_empty() || value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return false;
     }
     if pattern == "*" {
@@ -692,32 +775,37 @@ pub fn claim_matches_pattern(value: &str, pattern: &str) -> bool {
         return value == pattern;
     }
 
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.is_empty() {
-        return true;
+    fn match_bytes(v: &[u8], p: &[u8]) -> bool {
+        if p.is_empty() {
+            return v.is_empty();
+        }
+        if p[0] == b'*' {
+            let mut next_p = 1usize;
+            while next_p < p.len() && p[next_p] == b'*' {
+                next_p += 1;
+            }
+            if next_p == p.len() {
+                return true;
+            }
+            // If this wildcard is immediately followed by ':', forbid matching across ':'
+            let stop_on_colon = p[next_p] == b':';
+            for i in 0..=v.len() {
+                if stop_on_colon && i > 0 && v[i - 1] == b':' {
+                    break;
+                }
+                if match_bytes(&v[i..], &p[next_p..]) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if !v.is_empty() && p[0] == v[0] {
+            return match_bytes(&v[1..], &p[1..]);
+        }
+        false
     }
 
-    let mut pos = 0usize;
-    for (idx, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if idx == 0 && !pattern.starts_with('*') {
-            if !value.starts_with(part) {
-                return false;
-            }
-            pos = part.len();
-            continue;
-        }
-        if idx == parts.len() - 1 && !pattern.ends_with('*') {
-            return value[pos..].ends_with(part);
-        }
-        match value[pos..].find(part) {
-            Some(found) => pos += found + part.len(),
-            None => return false,
-        }
-    }
-    true
+    match_bytes(value.as_bytes(), pattern.as_bytes())
 }
 
 /// Validate OIDC binding configuration fields (including `issuer` and `jwks_uri` SSRF checks)
@@ -751,8 +839,7 @@ pub fn validate_oidc_binding_fields_with_jwks(
     let allow_loopback = env_flag_enabled("SV_ALLOW_INSECURE_OIDC_LOOPBACK");
     let allow_private = env_flag_enabled("SV_ALLOW_PRIVATE_OIDC_ENDPOINTS");
 
-    let (clean_issuer, _, _) =
-        parse_and_validate_oidc_url(issuer, allow_loopback, allow_private)?;
+    let (clean_issuer, _, _) = parse_and_validate_oidc_url(issuer, allow_loopback, allow_private)?;
     let (clean_jwks_uri, _, _) =
         parse_and_validate_oidc_url(jwks_uri, allow_loopback, allow_private)?;
 
@@ -803,7 +890,10 @@ pub fn validate_oidc_binding_fields(
     allowed_paths: &[String],
     capabilities: &[String],
 ) -> Result<(String, String, String, String, String, String, Vec<String>), &'static str> {
-    let default_jwks = format!("{}/.well-known/jwks.json", issuer.trim().trim_end_matches('/'));
+    let default_jwks = format!(
+        "{}/.well-known/jwks.json",
+        issuer.trim().trim_end_matches('/')
+    );
     let (n, p, iss, _jwks, aud, clm, pat, paths) = validate_oidc_binding_fields_with_jwks(
         name,
         project,
@@ -1016,20 +1106,45 @@ pub fn verify_oidc_jwt_and_resolve(
     if now_unix >= exp {
         return Err(OidcError::TokenExpired(exp, now_unix));
     }
+    // SV-AUD-03: Enforce maximum 24h remaining token lifetime even if `iat` is omitted
+    if exp.saturating_sub(now_unix) > MAX_OIDC_TOKEN_LIFETIME_SECS + CLOCK_SKEW_LEEWAY_SECS {
+        return Err(OidcError::TokenNotYetValid(exp, now_unix));
+    }
 
-    if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_i64()) {
+    if let Some(nbf_val) = claims.get("nbf") {
+        let nbf = nbf_val
+            .as_i64()
+            .ok_or_else(|| OidcError::InvalidJson("nbf claim must be an integer".to_string()))?;
         if now_unix + CLOCK_SKEW_LEEWAY_SECS < nbf {
             return Err(OidcError::TokenNotYetValid(nbf, now_unix));
         }
     }
 
-    if let Some(iat) = claims.get("iat").and_then(|v| v.as_i64()) {
+    if let Some(iat_val) = claims.get("iat") {
+        let iat = iat_val
+            .as_i64()
+            .ok_or_else(|| OidcError::InvalidJson("iat claim must be an integer".to_string()))?;
         if iat > now_unix + CLOCK_SKEW_LEEWAY_SECS
+            || exp < iat
             || exp.saturating_sub(iat) > MAX_OIDC_TOKEN_LIFETIME_SECS
         {
             return Err(OidcError::TokenNotYetValid(iat, now_unix));
         }
     }
+
+    let jti_opt = match claims.get("jti") {
+        Some(v) => {
+            let s = v
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+                .ok_or_else(|| {
+                    OidcError::InvalidJson("jti claim must be a 1..=128 char string".to_string())
+                })?;
+            Some(s.to_string())
+        }
+        None => None,
+    };
 
     let issuer_bindings: Vec<&OidcBinding> = bindings
         .iter()
@@ -1051,9 +1166,11 @@ pub fn verify_oidc_jwt_and_resolve(
     for binding in issuer_bindings {
         // Resolve ONLY the keys trusted for this specific binding:
         let binding_keys: Vec<JwkKey> = match binding.inline_jwks_json.as_deref() {
-            Some(inline) if !inline.trim().is_empty() => serde_json::from_str::<JwksDocument>(inline)
-                .map(|d| d.keys)
-                .unwrap_or_default(),
+            Some(inline) if !inline.trim().is_empty() => {
+                serde_json::from_str::<JwksDocument>(inline)
+                    .map(|d| d.keys)
+                    .unwrap_or_default()
+            }
             _ => cache
                 .get_binding_keys(&binding.binding_id)
                 .or_else(|| cache.get_issuer_keys(&norm_iss))
@@ -1092,6 +1209,9 @@ pub fn verify_oidc_jwt_and_resolve(
             continue;
         };
         if claim_matches_pattern(claim_val, &binding.subject_pattern) {
+            if let Some(ref jti) = jti_opt {
+                cache.check_and_record_jti(&norm_iss, jti, exp, now_unix)?;
+            }
             let safe_sub: String = claim_val
                 .chars()
                 .map(|c| {
@@ -1163,8 +1283,18 @@ mod tests {
     #[test]
     fn test_ssrf_url_and_ip_blocking() {
         // Reject cleartext http://, cloud metadata IMDS, loopback, and RFC1918 by default
-        assert!(parse_and_validate_oidc_url("http://token.actions.githubusercontent.com", false, false).is_err());
-        assert!(parse_and_validate_oidc_url("https://169.254.169.254/latest/meta-data", true, true).is_err());
+        assert!(parse_and_validate_oidc_url(
+            "http://token.actions.githubusercontent.com",
+            false,
+            false
+        )
+        .is_err());
+        assert!(parse_and_validate_oidc_url(
+            "https://169.254.169.254/latest/meta-data",
+            true,
+            true
+        )
+        .is_err());
         assert!(parse_and_validate_oidc_url("https://127.0.0.1:8443/jwks", false, false).is_err());
         assert!(parse_and_validate_oidc_url("https://10.0.0.5/jwks", false, false).is_err());
         assert!(parse_and_validate_oidc_url("https://accounts.google.com", false, false).is_ok());
