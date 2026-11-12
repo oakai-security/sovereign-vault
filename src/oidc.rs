@@ -1178,7 +1178,6 @@ pub fn verify_oidc_jwt_and_resolve(
     let mut any_claim_matched = false;
     let mut any_keys_available = false;
     let mut any_kid_matched = false;
-    let mut any_sig_verified = false;
 
     for binding in issuer_bindings {
         // Evaluate fast claim predicates BEFORE expensive RSA/ECDSA signature verification (`SV-V2-08`)
@@ -1212,23 +1211,17 @@ pub fn verify_oidc_jwt_and_resolve(
         }
         any_keys_available = true;
 
-        match verify_against_keyset(
+        if let Err((matched_kid, _)) = verify_against_keyset(
             &binding_keys,
             header.kid.as_deref(),
             &header.alg,
             signing_input.as_bytes(),
             &sig_bytes,
         ) {
-            Ok(()) => {
+            if matched_kid {
                 any_kid_matched = true;
-                any_sig_verified = true;
             }
-            Err((matched_kid, _)) => {
-                if matched_kid {
-                    any_kid_matched = true;
-                }
-                continue;
-            }
+            continue;
         }
 
         if let Some(ref jti) = jti_opt {
@@ -1263,10 +1256,7 @@ pub fn verify_oidc_jwt_and_resolve(
     if !any_keys_available || !any_kid_matched {
         return Err(OidcError::SigningKeyNotFound(norm_iss, header.kid));
     }
-    if !any_sig_verified {
-        return Err(OidcError::SignatureVerificationFailed);
-    }
-    Err(OidcError::NoMatchingBinding(norm_iss))
+    Err(OidcError::SignatureVerificationFailed)
 }
 
 fn jwt_audience_matches(claims: &serde_json::Value, expected_aud: &str) -> bool {
