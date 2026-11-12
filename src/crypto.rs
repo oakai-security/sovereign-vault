@@ -109,6 +109,7 @@ impl LockedKey {
             #[cfg(target_os = "linux")]
             {
                 let _ = libc::madvise(map_ptr, alloc_len, libc::MADV_DONTDUMP);
+                let _ = libc::madvise(map_ptr, alloc_len, libc::MADV_WIPEONFORK);
             }
 
             let is_mlocked = libc::mlock(map_ptr, alloc_len) == 0;
@@ -117,6 +118,8 @@ impl LockedKey {
                     "mlock() returned non-zero (grant CAP_IPC_LOCK and check ulimits.memlock); zeroize-on-drop remains active"
                 );
             }
+
+            let _ = libc::mprotect(map_ptr, alloc_len, libc::PROT_READ);
 
             Ok(Self {
                 ptr: byte_ptr,
@@ -163,6 +166,11 @@ impl Drop for LockedKey {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
+            let _ = libc::mprotect(
+                self.ptr as *mut libc::c_void,
+                self.alloc_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
             let slice = std::slice::from_raw_parts_mut(self.ptr, self.alloc_len);
             slice.zeroize();
             if self.is_mlocked {
@@ -188,33 +196,35 @@ fn wrap_master_dek_with_unseal_key(
     unseal_key: &[u8; 32],
     master_dek: &[u8; 32],
 ) -> Result<EnvelopeHeader, CryptoError> {
-    let mut kdf_salt = [0u8; 32];
-    let mut dek_nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut kdf_salt);
-    rand::thread_rng().fill_bytes(&mut dek_nonce);
+    let mut kdf_salt = Zeroizing::new([0u8; 32]);
+    let mut dek_nonce = Zeroizing::new([0u8; 12]);
+    rand::thread_rng().fill_bytes(kdf_salt.as_mut());
+    rand::thread_rng().fill_bytes(dek_nonce.as_mut());
 
     let mut kek = Zeroizing::new([0u8; 32]);
-    let hk = Hkdf::<Sha512>::new(Some(&kdf_salt), unseal_key);
+    let hk = Hkdf::<Sha512>::new(Some(kdf_salt.as_ref()), unseal_key);
     hk.expand(KEK_INFO, kek.as_mut())
         .map_err(|_| CryptoError::AeadFailure)?;
 
     let cipher = Aes256Gcm::new_from_slice(kek.as_ref()).map_err(|_| CryptoError::AeadFailure)?;
-    let wrapped_dek = cipher
-        .encrypt(
-            Nonce::from_slice(&dek_nonce),
-            Payload {
-                msg: master_dek,
-                aad: ENVELOPE_AAD,
-            },
-        )
-        .map_err(|_| CryptoError::AeadFailure)?;
+    let wrapped_dek = Zeroizing::new(
+        cipher
+            .encrypt(
+                Nonce::from_slice(dek_nonce.as_ref()),
+                Payload {
+                    msg: master_dek,
+                    aad: ENVELOPE_AAD,
+                },
+            )
+            .map_err(|_| CryptoError::AeadFailure)?,
+    );
 
     Ok(EnvelopeHeader {
         version: 2,
         kdf: "hkdf-sha512".to_string(),
-        kdf_salt_hex: hex_encode(kdf_salt),
-        dek_nonce_hex: hex_encode(dek_nonce),
-        wrapped_dek_hex: hex_encode(wrapped_dek),
+        kdf_salt_hex: hex_encode(kdf_salt.as_ref()),
+        dek_nonce_hex: hex_encode(dek_nonce.as_ref()),
+        wrapped_dek_hex: hex_encode(wrapped_dek.as_slice()),
     })
 }
 
@@ -226,10 +236,14 @@ fn unwrap_raw_master_dek(
         return Err(CryptoError::CorruptEnvelope);
     }
 
-    let kdf_salt = hex_decode(&header.kdf_salt_hex).map_err(|_| CryptoError::CorruptEnvelope)?;
-    let dek_nonce = hex_decode(&header.dek_nonce_hex).map_err(|_| CryptoError::CorruptEnvelope)?;
-    let wrapped_dek =
-        hex_decode(&header.wrapped_dek_hex).map_err(|_| CryptoError::CorruptEnvelope)?;
+    let kdf_salt =
+        Zeroizing::new(hex_decode(&header.kdf_salt_hex).map_err(|_| CryptoError::CorruptEnvelope)?);
+    let dek_nonce = Zeroizing::new(
+        hex_decode(&header.dek_nonce_hex).map_err(|_| CryptoError::CorruptEnvelope)?,
+    );
+    let wrapped_dek = Zeroizing::new(
+        hex_decode(&header.wrapped_dek_hex).map_err(|_| CryptoError::CorruptEnvelope)?,
+    );
 
     if kdf_salt.len() != 32 || dek_nonce.len() != 12 {
         return Err(CryptoError::CorruptEnvelope);
@@ -372,12 +386,16 @@ pub fn compute_audit_chain_mac(
         inner.update((field.len() as u64).to_be_bytes());
         inner.update(field);
     }
-    let inner_digest = inner.finalize();
+    let mut inner_digest = inner.finalize();
 
     let mut outer = Sha512::new();
     outer.update(opad.as_slice());
-    outer.update(inner_digest);
-    hex_encode(outer.finalize())
+    outer.update(inner_digest.as_slice());
+    inner_digest.as_mut_slice().zeroize();
+    let mut outer_digest = outer.finalize();
+    let mac_hex = hex_encode(outer_digest.as_slice());
+    outer_digest.as_mut_slice().zeroize();
+    mac_hex
 }
 
 /// Construct canonical Associated Data (AAD) binding a secret ciphertext to its exact path, project, and version.

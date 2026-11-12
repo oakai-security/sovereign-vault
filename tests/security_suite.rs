@@ -1968,3 +1968,240 @@ async fn test_sv_aud_regressions_backup_rewrap_oidc_jti_nat64_glob_and_enroll() 
         .unwrap_or("")
         .contains("replay"));
 }
+
+#[tokio::test]
+async fn test_sv_v2_phase3_regressions_oidc_isolation_watermark_anchor_and_ssrf() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use sovereign_vault::oidc::is_disallowed_oidc_ip;
+    use sovereign_vault::storage::audit_anchor_path;
+    use std::net::IpAddr;
+
+    let (dir, state, app, _unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. SV-V2-12: IPv6 6to4 (`2002::/16`), Teredo (`2001:0000::/32`), IETF `192.0.0.0/24`, and benchmark `198.18.0.0/15` SSRF defense
+    let v6_6to4_imds: IpAddr = "2002:a9fe:a9fe::1".parse().unwrap(); // embeds 169.254.169.254
+    let v6_6to4_loopback: IpAddr = "2002:7f00:0001::1".parse().unwrap(); // embeds 127.0.0.1
+    let v6_teredo_imds: IpAddr = "2001:0000:4136:e378:8000:63bf:5601:5601".parse().unwrap(); // ~169.254.169.254 = 0x56015601
+    let v4_ietf: IpAddr = "192.0.0.1".parse().unwrap();
+    let v4_bench: IpAddr = "198.18.0.10".parse().unwrap();
+    assert!(
+        is_disallowed_oidc_ip(v6_6to4_imds, false, false),
+        "SV-V2-12: IPv6 6to4 embedding cloud metadata IP must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(v6_6to4_loopback, false, false),
+        "SV-V2-12: IPv6 6to4 embedding loopback IP must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(v6_teredo_imds, false, false),
+        "SV-V2-12: IPv6 Teredo tunnel must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(v4_ietf, false, false),
+        "SV-V2-12: IETF 192.0.0.0/24 must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(v4_bench, false, false),
+        "SV-V2-12: RFC 2544 benchmark 198.18.0.0/15 must be blocked"
+    );
+
+    // 2. SV-V2-01: Per-binding OIDC JWKS cache isolation (inline JWKS on Binding B must never verify Binding A)
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8_b = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let kp_b = Ed25519KeyPair::from_pkcs8(pkcs8_b.as_ref()).unwrap();
+    let pub_b = URL_SAFE_NO_PAD.encode(kp_b.public_key().as_ref());
+    let inline_jwks_b = json!({
+        "keys": [{
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "kid": "rogue-b-key",
+            "alg": "EdDSA",
+            "use": "sig",
+            "x": pub_b
+        }]
+    })
+    .to_string();
+
+    // Enroll Binding A (project "prod", remote issuer without inline JWKS)
+    let (st_a, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "prod",
+            "name": "prod-remote-binding",
+            "issuer": "https://issuer.shared.internal",
+            "audience": "sovereign-vault",
+            "subject_claim": "sub",
+            "subject_pattern": "repo:org/prod:*",
+            "allowed_paths": ["prod/*"],
+            "capabilities": ["read"]
+        })),
+    )
+    .await;
+    assert_eq!(st_a, StatusCode::CREATED);
+
+    // Enroll Binding B (project "sandbox", same issuer URL, with inline_jwks_json)
+    let (st_b, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "sandbox",
+            "name": "sandbox-inline-binding",
+            "issuer": "https://issuer.shared.internal",
+            "audience": "sovereign-vault",
+            "subject_claim": "sub",
+            "subject_pattern": "repo:org/sandbox:*",
+            "allowed_paths": ["sandbox/*"],
+            "capabilities": ["read"],
+            "inline_jwks_json": inline_jwks_b
+        })),
+    )
+    .await;
+    assert_eq!(st_b, StatusCode::CREATED);
+
+    // Mint a JWT signed by Binding B's inline key but claiming Binding A's subject (`repo:org/prod:main`)
+    let now = sovereign_vault::storage::now_unix_seconds();
+    let hdr_b64 = URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&json!({"alg": "EdDSA", "kid": "rogue-b-key"})).unwrap());
+    let pay_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "iss": "https://issuer.shared.internal",
+            "sub": "repo:org/prod:main",
+            "aud": "sovereign-vault",
+            "iat": now,
+            "exp": now + 600,
+            "jti": "cross-binding-attempt-1"
+        }))
+        .unwrap(),
+    );
+    let signing_input = format!("{hdr_b64}.{pay_b64}");
+    let sig = kp_b.sign(signing_input.as_bytes());
+    let forged_jwt = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
+
+    let (forged_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("Authorization", &format!("Bearer {forged_jwt}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        forged_st,
+        StatusCode::UNAUTHORIZED,
+        "SV-V2-01: Inline JWKS from Binding B must never cross-contaminate or verify Binding A"
+    );
+
+    // 3. SV-V2-03 & SV-V2-12: Monotonic version watermark across DELETE + PUT and bounded history pruning (20 versions)
+    for i in 1..=25 {
+        let (put_st, put_body) = send_json(
+            &app,
+            Method::PUT,
+            "/v1/secret/prod/watermark/test_key",
+            &[("X-Vault-Token", &admin_token)],
+            Some(json!({
+                "project": "prod",
+                "value": format!("val-v{i}")
+            })),
+        )
+        .await;
+        assert_eq!(put_st, StatusCode::OK);
+        assert_eq!(put_body["version"], i);
+    }
+
+    // Version 5 (older than 25 - 20 = 5) should be pruned (`SV-V2-12`), while version 25 is active
+    let (v5_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/prod/watermark/test_key?version=5",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        v5_st,
+        StatusCode::NOT_FOUND,
+        "SV-V2-12: Versions beyond the 20-version retention window must be pruned"
+    );
+
+    // Delete the secret and re-create it: version MUST advance to 26 (never resetting to 1, `SV-V2-03`)
+    let (del_st, _) = send_json(
+        &app,
+        Method::DELETE,
+        "/v1/secret/prod/watermark/test_key",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(del_st, StatusCode::NO_CONTENT);
+
+    let (reput_st, reput_body) = send_json(
+        &app,
+        Method::PUT,
+        "/v1/secret/prod/watermark/test_key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "prod",
+            "value": "val-after-delete"
+        })),
+    )
+    .await;
+    assert_eq!(reput_st, StatusCode::OK);
+    assert_eq!(
+        reput_body["version"], 26,
+        "SV-V2-03: Recreating a deleted secret path must strictly advance its monotonic version watermark (26, not 1)"
+    );
+
+    // 4. SV-V2-02: Deleting or corrupting `vault.audit_anchor` while running must fail-closed (500) on secret reads/writes
+    let anchor_file = audit_anchor_path(dir.path());
+    let saved_anchor = std::fs::read(&anchor_file).unwrap();
+    std::fs::remove_file(&anchor_file).unwrap();
+
+    let (tampered_read_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/prod/watermark/test_key",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        tampered_read_st,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "SV-V2-02: Missing vault.audit_anchor must fail-closed on secret reads instead of healing the anchor"
+    );
+
+    // Restore valid anchor and verify secret read succeeds again
+    std::fs::write(&anchor_file, &saved_anchor).unwrap();
+    let (restored_read_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secret/prod/watermark/test_key",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(restored_read_st, StatusCode::OK);
+
+    // 5. SV-V2-06: Sealing the vault purges all cached OIDC keys and consumed JTIs
+    assert!(state.oidc_cache.total_cached_keys() > 0);
+    let (seal_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/seal",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(seal_st, StatusCode::OK);
+    assert_eq!(
+        state.oidc_cache.total_cached_keys(),
+        0,
+        "SV-V2-06: Sealing the vault must purge all cached OIDC keys"
+    );
+}

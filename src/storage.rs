@@ -23,6 +23,7 @@ const DB_FILENAME: &str = "vault.db";
 const AUDIT_ANCHOR_FILENAME: &str = "vault.audit_anchor";
 const AUDIT_GENESIS_MAC: &str = "GENESIS_SOVEREIGN_VAULT_V2";
 const MAX_BACKUP_SNAPSHOTS: usize = 20;
+const MAX_SECRET_VERSIONS_PER_PATH: i64 = 20;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -32,6 +33,8 @@ pub enum StorageError {
     Json(#[from] serde_json::Error),
     #[error("SQLCipher database error: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("Audit chain or external anchor integrity violation: {0}")]
+    AuditIntegrityViolation(&'static str),
 }
 
 pub struct StoredSecretRecord {
@@ -179,17 +182,16 @@ fn compute_anchor_mac(audit_key: &LockedKey, seq: i64, entry_mac_sha512: &str) -
     )
 }
 
-fn write_audit_anchor(
+fn verify_audit_anchor_continuity(
     data_dir: &Path,
     audit_key: &LockedKey,
     seq: i64,
     prev_mac_sha512: &str,
-    entry_mac_sha512: &str,
 ) -> Result<(), StorageError> {
     let final_path = audit_anchor_path(data_dir);
-    // SV-AUD-01: Verify continuity with the existing anchor before overwriting so that
+    // SV-AUD-01 & SV-V2-02: Verify continuity with the existing anchor before committing so that
     // a truncated or wiped `audit_log` (or deleted anchor file) can NEVER be silently re-anchored
-    // by a subsequent `sys.unseal`, `auth.failed`, or data event.
+    // and any secret read/mutation fails closed (`Err(StorageError::AuditIntegrityViolation)`).
     if final_path.exists() {
         match read_audit_anchor(data_dir) {
             Ok(Some(existing)) => {
@@ -205,14 +207,18 @@ fn write_audit_anchor(
                         new_seq = seq,
                         "Audit chain continuity violation: refusing to overwrite high-water audit anchor"
                     );
-                    return Ok(());
+                    return Err(StorageError::AuditIntegrityViolation(
+                        "Audit chain continuity violation against vault.audit_anchor",
+                    ));
                 }
             }
             Ok(None) | Err(_) => {
                 tracing::error!(
                     "Corrupt vault.audit_anchor detected: refusing to overwrite tamper state"
                 );
-                return Ok(());
+                return Err(StorageError::AuditIntegrityViolation(
+                    "Corrupt vault.audit_anchor file",
+                ));
             }
         }
     } else if seq != 1 || !constant_time_str_eq(prev_mac_sha512, AUDIT_GENESIS_MAC) {
@@ -220,9 +226,20 @@ fn write_audit_anchor(
             new_seq = seq,
             "Missing vault.audit_anchor for non-genesis audit event: refusing to recreate anchor"
         );
-        return Ok(());
+        return Err(StorageError::AuditIntegrityViolation(
+            "Missing vault.audit_anchor for non-genesis audit event",
+        ));
     }
+    Ok(())
+}
 
+fn commit_audit_anchor_file(
+    data_dir: &Path,
+    audit_key: &LockedKey,
+    seq: i64,
+    entry_mac_sha512: &str,
+) -> Result<(), StorageError> {
+    let final_path = audit_anchor_path(data_dir);
     let anchor = AuditChainAnchor {
         seq,
         entry_mac_sha512: entry_mac_sha512.to_string(),
@@ -306,9 +323,9 @@ fn append_audit_in_tx(
         params![seq, now, event_type, actor, resource, outcome, prev_mac, entry_mac],
     )?;
 
-    // SV-AUD-10: Persist anchor inside the transaction scope before tx.commit() so any disk I/O
-    // failure rolls back the SQLite transaction rather than leaving vault.db and anchor out of sync.
-    write_audit_anchor(data_dir, audit_key, seq, &prev_mac, &entry_mac)?;
+    // SV-V2-02: Verify existing anchor continuity BEFORE tx.commit(), then persist anchor file
+    // immediately after tx.commit() so failed SQLite commits cannot advance or desynchronize anchor.
+    verify_audit_anchor_continuity(data_dir, audit_key, seq, &prev_mac)?;
 
     Ok(AuditLogEntry {
         seq,
@@ -371,6 +388,11 @@ impl Storage {
                  PRIMARY KEY (path, version)
              );
 
+             CREATE TABLE IF NOT EXISTS secret_version_watermarks (
+                 path TEXT PRIMARY KEY,
+                 max_version INTEGER NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS tokens (
                  token_id TEXT PRIMARY KEY,
                  token_hash_sha512 TEXT NOT NULL,
@@ -419,12 +441,16 @@ impl Storage {
         })
     }
 
-    /// Return the next monotonic version number for `path` (starts at `1`).
+    /// Return the next monotonic version number for `path` (starts at `1` and never resets after delete, `SV-V2-03`).
     pub fn next_secret_version(&self, path: &str) -> Result<i64, StorageError> {
         let current: Option<i64> = self
             .conn
             .query_row(
-                "SELECT MAX(version) FROM secret_versions WHERE path = ?",
+                "SELECT MAX(v) FROM (
+                     SELECT MAX(version) AS v FROM secret_versions WHERE path = ?1
+                     UNION ALL
+                     SELECT max_version AS v FROM secret_version_watermarks WHERE path = ?1
+                 )",
                 params![path],
                 |row| row.get(0),
             )
@@ -454,6 +480,16 @@ impl Storage {
             params![path, version, project, ciphertext, nonce.as_slice(), now],
         )?;
         tx.execute(
+            "INSERT INTO secret_version_watermarks (path, max_version)
+             VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET max_version = MAX(secret_version_watermarks.max_version, excluded.max_version)",
+            params![path, version],
+        )?;
+        tx.execute(
+            "DELETE FROM secret_versions WHERE path = ?1 AND version <= (?2 - ?3)",
+            params![path, version, MAX_SECRET_VERSIONS_PER_PATH],
+        )?;
+        tx.execute(
             "INSERT INTO secrets (path, project, current_version, ciphertext, nonce, updated_at)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(path) DO UPDATE SET
@@ -474,6 +510,12 @@ impl Storage {
             &outcome,
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(entry)
     }
 
@@ -492,6 +534,16 @@ impl Storage {
             "INSERT INTO secret_versions (path, version, project, ciphertext, nonce, created_at)
              VALUES (?, ?, ?, ?, ?, ?)",
             params![path, version, project, ciphertext, nonce.as_slice(), now],
+        )?;
+        tx.execute(
+            "INSERT INTO secret_version_watermarks (path, max_version)
+             VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET max_version = MAX(secret_version_watermarks.max_version, excluded.max_version)",
+            params![path, version],
+        )?;
+        tx.execute(
+            "DELETE FROM secret_versions WHERE path = ?1 AND version <= (?2 - ?3)",
+            params![path, version, MAX_SECRET_VERSIONS_PER_PATH],
         )?;
         tx.execute(
             "INSERT INTO secrets (path, project, current_version, ciphertext, nonce, updated_at)
@@ -534,7 +586,7 @@ impl Storage {
                     "SELECT sv.project, sv.version, sv.ciphertext, sv.nonce
                      FROM secret_versions sv
                      INNER JOIN secrets s ON s.path = sv.path
-                     WHERE sv.path = ? AND sv.version = ?",
+                     WHERE sv.path = ? AND sv.version = ? AND s.project = sv.project",
                     params![path, ver],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
@@ -584,6 +636,12 @@ impl Storage {
             "deleted",
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(Some(entry))
     }
 
@@ -669,6 +727,12 @@ impl Storage {
             "created",
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(entry)
     }
 
@@ -707,7 +771,12 @@ impl Storage {
                     expires_at,
                 }))
             }
-            None => Ok(None),
+            None => {
+                // SV-V2-11: Equalize JSON array deserialization allocations on token_id miss
+                let _ = std::hint::black_box(serde_json::from_str::<Vec<String>>("[\"*\"]"));
+                let _ = std::hint::black_box(serde_json::from_str::<Vec<String>>("[\"read\"]"));
+                Ok(None)
+            }
         }
     }
 
@@ -732,6 +801,12 @@ impl Storage {
             "revoked",
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(Some(entry))
     }
 
@@ -794,6 +869,12 @@ impl Storage {
             "created",
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(entry)
     }
 
@@ -921,6 +1002,12 @@ impl Storage {
             "revoked",
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(Some(entry))
     }
 
@@ -1043,6 +1130,12 @@ impl Storage {
             outcome,
         )?;
         tx.commit()?;
+        commit_audit_anchor_file(
+            &self.data_dir,
+            audit_key,
+            entry.seq,
+            &entry.entry_mac_sha512,
+        )?;
         Ok(entry)
     }
 

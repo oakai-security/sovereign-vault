@@ -26,7 +26,8 @@ use crate::oidc::{
 use crate::storage::{
     audit_anchor_path, database_path, envelope_path, has_partial_initialization,
     is_vault_initialized, now_unix_seconds, read_envelope_header, update_backup_envelopes,
-    write_envelope_header, AuditLogEntry, SecretMetadataItem, Storage, TokenMetadataItem,
+    write_envelope_header, AuditLogEntry, SecretMetadataItem, Storage, StorageError,
+    TokenMetadataItem,
 };
 use crate::telemetry::SiemForwarder;
 use axum::{
@@ -556,6 +557,15 @@ fn authenticate_caller(
         }
     };
 
+    if raw_tok.len() > 16_384 {
+        state.check_token_rate_limit_ip(peer_ip)?;
+        state.record_token_auth_failure_ip(peer_ip);
+        return Err(api_err(
+            StatusCode::UNAUTHORIZED,
+            "Authentication token exceeds maximum length (16 KiB)",
+        ));
+    }
+
     // Route 1: OIDC JWT Workload Identity (3 dot-separated Base64URL segments)
     if !raw_tok.starts_with("sv_live_")
         && !raw_tok.starts_with("sv_admin_")
@@ -853,8 +863,14 @@ async fn unseal_handler(
         ));
     }
 
+    if state.active.read().await.is_some() {
+        state.record_auth_failure_ip(peer_ip);
+        return Err(api_err(StatusCode::CONFLICT, "Vault is already unsealed"));
+    }
+
     let mut active_guard = state.active.write().await;
     if active_guard.is_some() {
+        state.record_auth_failure_ip(peer_ip);
         return Err(api_err(StatusCode::CONFLICT, "Vault is already unsealed"));
     }
 
@@ -905,22 +921,30 @@ async fn unseal_handler(
         )
     })?;
     let existing_bindings = storage.list_oidc_bindings().unwrap_or_default();
-    let unseal_entry = storage
-        .append_audit_event(
-            &audit_chain_key,
-            "sys.unseal",
-            "unseal-operator",
-            "sys/vault",
-            "unsealed",
-        )
-        .map_err(|_| {
-            api_err(
+    match storage.append_audit_event(
+        &audit_chain_key,
+        "sys.unseal",
+        "unseal-operator",
+        "sys/vault",
+        "unsealed",
+    ) {
+        Ok(unseal_entry) => {
+            if let Some(ref forwarder) = state.siem_forwarder {
+                forwarder.emit(unseal_entry);
+            }
+        }
+        Err(StorageError::AuditIntegrityViolation(reason)) => {
+            tracing::error!(
+                reason = %reason,
+                "Audit log or anchor integrity violation detected during unseal; unsealing in degraded read-blocked state so administrator can inspect /v1/sys/audit"
+            );
+        }
+        Err(_) => {
+            return Err(api_err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to persist unseal audit event",
-            )
-        })?;
-    if let Some(ref forwarder) = state.siem_forwarder {
-        forwarder.emit(unseal_entry);
+            ));
+        }
     }
 
     *active_guard = Some(VaultActiveState {
@@ -1324,6 +1348,7 @@ async fn enroll_oidc_binding_handler(
     if let Some(ref forwarder) = active.siem_forwarder {
         forwarder.emit(entry);
     }
+    drop(active_guard);
 
     // Automatically refresh in-memory JWKS cache immediately when an admin adds/updates a provider!
     let jwks_refresh = state.oidc_cache.refresh_bindings(&all_bindings).await;
@@ -1437,6 +1462,7 @@ async fn revoke_oidc_binding_handler(
     if let Some(ref forwarder) = active.siem_forwarder {
         forwarder.emit(entry);
     }
+    drop(active_guard);
 
     let _ = state.oidc_cache.refresh_bindings(&remaining).await;
     Ok(StatusCode::NO_CONTENT)
@@ -1479,9 +1505,15 @@ async fn refresh_oidc_jwks_handler(
             )
         })?
     };
+    drop(active_guard);
 
     let refreshed_issuers = state.oidc_cache.refresh_bindings(&bindings).await;
     let total_cached_keys = state.oidc_cache.total_cached_keys();
+
+    let active_guard = state.active.read().await;
+    let active = active_guard
+        .as_ref()
+        .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed"))?;
     record_audit_strict(
         active,
         "oidc.jwks.refresh",
@@ -1529,11 +1561,17 @@ async fn seal_handler(
         .as_ref()
         .ok_or_else(|| api_err(StatusCode::SERVICE_UNAVAILABLE, "Vault is already sealed"))?;
 
-    record_audit_strict(active, "sys.seal", &caller_id, "sys/vault", "sealed")?;
+    if let Err(e) = record_audit_strict(active, "sys.seal", &caller_id, "sys/vault", "sealed") {
+        tracing::error!(
+            token_id = %caller_id,
+            status = %e.0,
+            "Audit persistence failed during seal; proceeding with emergency RAM key zeroization"
+        );
+    }
     *active_guard = None;
     drop(active_guard);
 
-    let _ = state.oidc_cache.refresh_bindings(&[]).await;
+    state.oidc_cache.clear_all();
 
     tracing::warn!(token_id = %caller_id, "Vault sealed via administrative request; RAM keys zeroized and unlocked.");
     Ok(Json(serde_json::json!({
