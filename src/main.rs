@@ -23,7 +23,8 @@ use sovereign_vault::{
     server::{
         self, AppState, AuditLogResponse, EnrollOidcBindingResponse, EnrollTokenResponse,
         HealthResponse, InitVaultResponse, ListOidcBindingsResponse, ListSecretsResponse,
-        ListTokensResponse, RefreshOidcResponse, RotateUnsealKeyResponse, SecretResponse,
+        ListTokensResponse, PutSecretRequest, RefreshOidcResponse, RotateUnsealKeyRequest,
+        RotateUnsealKeyResponse, SecretResponse, UnsealRequest,
     },
     storage::{is_vault_initialized, BackupMetadata},
     telemetry::{
@@ -470,10 +471,16 @@ fn validate_transport_url(raw_url: &str) -> Result<String, String> {
     }
     if let Some(rest) = trimmed.strip_prefix("http://") {
         let host_port = rest.split('/').next().unwrap_or("");
-        let is_loopback = host_port.starts_with("127.")
-            || host_port == "localhost"
-            || host_port.starts_with("localhost:")
-            || host_port.starts_with("[::1]");
+        let host_only = if let Some(bracketed) = host_port.strip_prefix('[') {
+            bracketed.split(']').next().unwrap_or("")
+        } else {
+            host_port.split(':').next().unwrap_or("")
+        };
+        let is_loopback = host_only.eq_ignore_ascii_case("localhost")
+            || host_only
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
         let allow_insecure = std::env::var("VAULT_ALLOW_INSECURE_HTTP")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false);
@@ -487,6 +494,41 @@ fn validate_transport_url(raw_url: &str) -> Result<String, String> {
     Err(format!(
         "Unsupported URL scheme in '{trimmed}' (expected https:// or http://127.0.0.1:8443)"
     ))
+}
+
+/// Validate that a `--map ENV_VAR=secret/path` target environment variable name conforms to POSIX
+/// `[a-zA-Z_][a-zA-Z0-9_]*` and is not a privileged dynamic-linker or shell-startup variable.
+fn validate_env_var_name(raw: &str) -> Result<&str, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("Environment variable name in --map cannot be empty".to_string());
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(format!(
+            "Invalid environment variable name '{name}': must match [a-zA-Z_][a-zA-Z0-9_]*"
+        ));
+    }
+    const BLOCKED_ENV_VARS: &[&str] = &[
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "BASH_ENV",
+        "ENV",
+        "DYLD_INSERT_LIBRARIES",
+    ];
+    if BLOCKED_ENV_VARS
+        .iter()
+        .any(|blocked| name.eq_ignore_ascii_case(blocked))
+    {
+        return Err(format!(
+            "Refusing to map secret onto privileged dynamic-linker/shell variable '{name}'"
+        ));
+    }
+    Ok(name)
 }
 
 fn build_http_client(
@@ -519,91 +561,91 @@ async fn resolve_tls_config(
     custom_key: Option<PathBuf>,
     custom_sans: Option<String>,
 ) -> Result<axum_server::tls_rustls::RustlsConfig, Box<dyn std::error::Error>> {
-    let (cert_bytes, key_bytes, fp): (Vec<u8>, Zeroizing<Vec<u8>>, String) =
-        match (custom_cert, custom_key) {
-            (Some(cert_path), Some(key_path)) => {
-                tracing::info!(
-                    "Loading custom TLS certificate from {:?} and private key from {:?}",
-                    cert_path,
-                    key_path
-                );
-                let c_bytes = tokio::fs::read(&cert_path).await?;
-                let k_bytes = Zeroizing::new(tokio::fs::read(&key_path).await?);
-                let pem_str = String::from_utf8_lossy(&c_bytes);
-                let fp = compute_pem_fingerprint(&pem_str)
-                    .unwrap_or_else(|| "UNKNOWN (could not parse PEM DER)".to_string());
-                (c_bytes, k_bytes, fp)
+    let (cert_bytes, key_bytes, fp): (Vec<u8>, Zeroizing<Vec<u8>>, String) = match (
+        custom_cert,
+        custom_key,
+    ) {
+        (Some(cert_path), Some(key_path)) => {
+            tracing::info!(
+                "Loading custom TLS certificate from {:?} and private key from {:?}",
+                cert_path,
+                key_path
+            );
+            let c_bytes = tokio::fs::read(&cert_path).await?;
+            let k_bytes = Zeroizing::new(tokio::fs::read(&key_path).await?);
+            let pem_str = String::from_utf8_lossy(&c_bytes);
+            let fp = compute_pem_fingerprint(&pem_str)
+                .unwrap_or_else(|| "UNKNOWN (could not parse PEM DER)".to_string());
+            (c_bytes, k_bytes, fp)
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("Both --tls-cert and --tls-key must be provided together.".into());
+        }
+        (None, None) => {
+            let tls_dir = data_dir.join("tls");
+            tokio::fs::create_dir_all(&tls_dir).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&tls_dir, std::fs::Permissions::from_mode(0o700));
             }
-            (Some(_), None) | (None, Some(_)) => {
-                return Err("Both --tls-cert and --tls-key must be provided together.".into());
-            }
-            (None, None) => {
-                let tls_dir = data_dir.join("tls");
-                tokio::fs::create_dir_all(&tls_dir).await?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&tls_dir, std::fs::Permissions::from_mode(0o700));
-                }
-                let cert_file = tls_dir.join("cert.pem");
-                let key_file = tls_dir.join("key.pem");
+            let cert_file = tls_dir.join("cert.pem");
+            let key_file = tls_dir.join("key.pem");
 
-                if cert_file.exists() && key_file.exists() {
-                    tracing::info!(
-                        "Reusing existing self-signed TLS credentials in {:?}",
-                        tls_dir
-                    );
-                    let c_bytes = tokio::fs::read(&cert_file).await?;
-                    let k_bytes = Zeroizing::new(tokio::fs::read(&key_file).await?);
-                    let pem_str = String::from_utf8_lossy(&c_bytes);
-                    let fp =
-                        compute_pem_fingerprint(&pem_str).unwrap_or_else(|| "UNKNOWN".to_string());
-                    (c_bytes, k_bytes, fp)
-                } else {
-                    tracing::info!(
+            if cert_file.exists() && key_file.exists() {
+                tracing::info!(
+                    "Reusing existing self-signed TLS credentials in {:?}",
+                    tls_dir
+                );
+                let c_bytes = tokio::fs::read(&cert_file).await?;
+                let k_bytes = Zeroizing::new(tokio::fs::read(&key_file).await?);
+                let pem_str = String::from_utf8_lossy(&c_bytes);
+                let fp = compute_pem_fingerprint(&pem_str).unwrap_or_else(|| "UNKNOWN".to_string());
+                (c_bytes, k_bytes, fp)
+            } else {
+                tracing::info!(
                         "Generating autonomous zero-config self-signed ECDSA TLS certificate (397-day validity)..."
                     );
-                    let mut sans: Vec<String> = vec![
-                        "localhost".to_string(),
-                        "127.0.0.1".to_string(),
-                        "::1".to_string(),
-                    ];
-                    if let Some(extra_sans) = custom_sans {
-                        for s in extra_sans.split(',') {
-                            let trimmed = s.trim();
-                            if !trimmed.is_empty() && !sans.iter().any(|x| x == trimmed) {
-                                sans.push(trimmed.to_string());
-                            }
+                let mut sans: Vec<String> = vec![
+                    "localhost".to_string(),
+                    "127.0.0.1".to_string(),
+                    "::1".to_string(),
+                ];
+                if let Some(extra_sans) = custom_sans {
+                    for s in extra_sans.split(',') {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() && !sans.iter().any(|x| x == trimmed) {
+                            sans.push(trimmed.to_string());
                         }
                     }
-                    let (cert_pem, raw_key_pem, fp) = generate_self_signed_tls_cert(&sans)
-                        .map_err(|e| format!("Failed generating self-signed TLS cert: {e}"))?;
-                    let key_pem = Zeroizing::new(raw_key_pem);
-                    tokio::fs::write(&cert_file, &cert_pem).await?;
-
-                    #[cfg(unix)]
-                    {
-                        use std::io::Write;
-                        use std::os::unix::fs::OpenOptionsExt;
-                        let mut opts = std::fs::OpenOptions::new();
-                        opts.write(true).create(true).truncate(true).mode(0o600);
-                        let mut f = opts.open(&key_file)?;
-                        f.write_all(key_pem.as_bytes())?;
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        tokio::fs::write(&key_file, key_pem.as_bytes()).await?;
-                    }
-
-                    (
-                        cert_pem.into_bytes(),
-                        Zeroizing::new(key_pem.as_bytes().to_vec()),
-                        fp,
-                    )
                 }
+                let (cert_pem, raw_key_pem, fp) = generate_self_signed_tls_cert(&sans)
+                    .map_err(|e| format!("Failed generating self-signed TLS cert: {e}"))?;
+                let key_pem = Zeroizing::new(raw_key_pem);
+                tokio::fs::write(&cert_file, &cert_pem).await?;
+
+                #[cfg(unix)]
+                {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create(true).truncate(true).mode(0o600);
+                    let mut f = opts.open(&key_file)?;
+                    f.write_all(key_pem.as_bytes())?;
+                }
+                #[cfg(not(unix))]
+                {
+                    tokio::fs::write(&key_file, key_pem.as_bytes()).await?;
+                }
+
+                (
+                    cert_pem.into_bytes(),
+                    Zeroizing::new(key_pem.as_bytes().to_vec()),
+                    fp,
+                )
             }
-        };
+        }
+    };
 
     tracing::info!(
         "================================================================================"
@@ -887,16 +929,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let base = validate_transport_url(&url)?;
             let key = read_secret_input("Paste 64-hex Unseal Key (hidden): ", stdin)?;
             let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
-            let mut req_body = Zeroizing::new(
-                serde_json::to_vec(&serde_json::json!({ "unseal_key": key.as_str() }))?,
-            );
+            let req_struct = UnsealRequest {
+                unseal_key: key.as_str().to_string(),
+            };
+            let mut req_body = Zeroizing::new(serde_json::to_vec(&req_struct)?);
+            drop(req_struct);
             let resp = client
                 .post(format!("{base}/v1/sys/unseal"))
                 .header("content-type", "application/json")
-                .body(req_body.as_slice().to_vec())
+                .body(std::mem::take(&mut *req_body))
                 .send()
                 .await?;
-            req_body.zeroize();
             let status = resp.status();
             let body: serde_json::Value = resp.json().await?;
             if !status.is_success() {
@@ -923,10 +966,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let current_key =
                 read_secret_input("Paste Current 64-hex Unseal Key (hidden): ", key_stdin)?;
             let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
+            let req_struct = RotateUnsealKeyRequest {
+                current_unseal_key: current_key.as_str().to_string(),
+            };
+            let mut req_body = Zeroizing::new(serde_json::to_vec(&req_struct)?);
+            drop(req_struct);
             let resp = client
                 .post(format!("{base}/v1/sys/rotate-unseal-key"))
                 .header("X-Vault-Token", tok.as_str())
-                .json(&serde_json::json!({ "current_unseal_key": current_key.as_str() }))
+                .header("content-type", "application/json")
+                .body(std::mem::take(&mut *req_body))
                 .send()
                 .await?;
             let status = resp.status();
@@ -1021,9 +1070,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (env_key, secret_path) = item.split_once('=').ok_or_else(|| {
                     format!("Invalid --map '{item}': expected ENV_VAR=secret/path")
                 })?;
-                if env_key.trim().is_empty() {
-                    return Err("Environment variable name in --map cannot be empty".into());
-                }
+                let valid_env_key = validate_env_var_name(env_key)?;
                 let resp = client
                     .get(format!(
                         "{base}/v1/secret/{}",
@@ -1039,10 +1086,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let sec: SecretResponse = resp.json().await?;
-                resolved_envs.push((
-                    env_key.trim().to_string(),
-                    Zeroizing::new(sec.value.clone()),
-                ));
+                resolved_envs.push((valid_env_key.to_string(), Zeroizing::new(sec.value.clone())));
             }
             drop(tok);
 
@@ -1081,10 +1125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (env_key, secret_path) = item.split_once('=').ok_or_else(|| {
                     format!("Invalid --map '{item}': expected ENV_VAR=secret/path")
                 })?;
-                let key_trimmed = env_key.trim();
-                if key_trimmed.is_empty() {
-                    return Err("Environment variable name in --map cannot be empty".into());
-                }
+                let key_trimmed = validate_env_var_name(env_key)?;
                 let resp = client
                     .get(format!(
                         "{base}/v1/secret/{}",
@@ -1100,12 +1141,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
                 let sec: SecretResponse = resp.json().await?;
-                let escaped_val = sec
-                    .value
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
-                dotenv_buf.push_str(&format!("{key_trimmed}=\"{escaped_val}\"\n"));
+                let escaped_val = Zeroizing::new(
+                    sec.value
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$")
+                        .replace('`', "\\`")
+                        .replace('\r', "\\r")
+                        .replace('\n', "\\n"),
+                );
+                dotenv_buf.push_str(key_trimmed);
+                dotenv_buf.push_str("=\"");
+                dotenv_buf.push_str(escaped_val.as_str());
+                dotenv_buf.push_str("\"\n");
             }
             drop(tok);
 
@@ -1385,13 +1433,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let secret_val =
                     read_secret_value_input("Paste Secret Value (hidden): ", value_stdin)?;
                 let client = build_http_client(cli.insecure, cli.ca_cert.as_ref(), None)?;
+                let req_struct = PutSecretRequest {
+                    project,
+                    value: secret_val.as_str().to_string(),
+                };
+                let mut req_body = Zeroizing::new(serde_json::to_vec(&req_struct)?);
+                drop(req_struct);
                 let resp = client
                     .put(format!("{base}/v1/secret/{}", path.trim_start_matches('/')))
                     .header("X-Vault-Token", tok.as_str())
-                    .json(&serde_json::json!({
-                        "project": project,
-                        "value": secret_val.as_str(),
-                    }))
+                    .header("content-type", "application/json")
+                    .body(std::mem::take(&mut *req_body))
                     .send()
                     .await?;
                 let status = resp.status();
@@ -1509,13 +1561,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         String::from_utf8_lossy(&o.stdout).trim().to_string(),
                                     );
                                     o.stdout.zeroize();
-                                    let unseal_res = client
-                                        .post(format!("{base}/v1/sys/unseal"))
-                                        .json(
-                                            &serde_json::json!({ "unseal_key": key_str.as_str() }),
-                                        )
-                                        .send()
-                                        .await;
+                                    o.stderr.zeroize();
+                                    let req_struct = UnsealRequest {
+                                        unseal_key: key_str.as_str().to_string(),
+                                    };
+                                    let unseal_res = match serde_json::to_vec(&req_struct) {
+                                        Ok(vec) => {
+                                            let mut req_body = Zeroizing::new(vec);
+                                            drop(req_struct);
+                                            client
+                                                .post(format!("{base}/v1/sys/unseal"))
+                                                .header("content-type", "application/json")
+                                                .body(std::mem::take(&mut *req_body))
+                                                .send()
+                                                .await
+                                        }
+                                        Err(e) => {
+                                            drop(req_struct);
+                                            eprintln!("Failed serializing unseal payload: {e}");
+                                            continue;
+                                        }
+                                    };
                                     match unseal_res {
                                         Ok(r) if r.status().is_success() => {
                                             eprintln!("Vault auto-unsealed successfully.");
@@ -1528,7 +1594,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
-                                _ => {
+                                Ok(mut o) => {
+                                    o.stdout.zeroize();
+                                    o.stderr.zeroize();
+                                    eprintln!("Key retrieval command failed; retrying next cycle.");
+                                }
+                                Err(_) => {
                                     eprintln!("Key retrieval command failed; retrying next cycle.");
                                 }
                             }
@@ -1540,4 +1611,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_env_var_name, validate_transport_url};
+
+    #[test]
+    fn test_validate_transport_url_blocks_spoofed_127_domain() {
+        assert!(validate_transport_url("https://vault.example.com:8443").is_ok());
+        assert!(validate_transport_url("http://127.0.0.1:8443").is_ok());
+        assert!(validate_transport_url("http://127.0.0.2:8443").is_ok());
+        assert!(validate_transport_url("http://localhost:8443").is_ok());
+        assert!(validate_transport_url("http://[::1]:8443").is_ok());
+
+        // SV-AUD-07 regression: domains starting with "127." or "[::1]" prefix must not pass loopback check
+        assert!(validate_transport_url("http://127.evil.example.com:8443").is_err());
+        assert!(validate_transport_url("http://127.0.0.1.evil.com:8443").is_err());
+        assert!(validate_transport_url("http://localhost.evil.com:8443").is_err());
+        assert!(validate_transport_url("http://10.0.0.5:8443").is_err());
+    }
+
+    #[test]
+    fn test_validate_env_var_name_blocks_injection_and_linker_hijack() {
+        assert_eq!(validate_env_var_name("DB_PASSWORD").unwrap(), "DB_PASSWORD");
+        assert_eq!(validate_env_var_name("_INTERNAL_2").unwrap(), "_INTERNAL_2");
+
+        // SV-AUD-08 regression: block newline/shell metacharacters and dynamic linker vars
+        assert!(validate_env_var_name("").is_err());
+        assert!(validate_env_var_name("1INVALID").is_err());
+        assert!(validate_env_var_name("BAD\nINJECTED=\"x\"").is_err());
+        assert!(validate_env_var_name("BAD-NAME").is_err());
+        assert!(validate_env_var_name("LD_PRELOAD").is_err());
+        assert!(validate_env_var_name("ld_preload").is_err());
+        assert!(validate_env_var_name("LD_LIBRARY_PATH").is_err());
+        assert!(validate_env_var_name("BASH_ENV").is_err());
+        assert!(validate_env_var_name("DYLD_INSERT_LIBRARIES").is_err());
+    }
 }

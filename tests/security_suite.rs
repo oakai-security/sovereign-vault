@@ -1197,7 +1197,8 @@ async fn send_json_from_ip(
         None => Body::empty(),
     };
     let mut req = builder.body(req_body).expect("build http request");
-    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
 
     let resp = app.clone().oneshot(req).await.expect("dispatch request");
     let status = resp.status();
@@ -1412,8 +1413,9 @@ async fn test_oidc_ssrf_block_and_cross_project_inline_jwks_isolation() {
 
     // Forged token signed with kp_b claiming `sub: "svc:alpha:api"` must fail 401!
     let now = sovereign_vault::storage::now_unix_seconds();
-    let hdr_b64 = URL_SAFE_NO_PAD
-        .encode(serde_json::to_vec(&json!({"alg": "EdDSA", "typ": "JWT", "kid": "shared-kid"})).unwrap());
+    let hdr_b64 = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({"alg": "EdDSA", "typ": "JWT", "kid": "shared-kid"})).unwrap(),
+    );
     let forged_claims_b64 = URL_SAFE_NO_PAD.encode(
         serde_json::to_vec(&json!({
             "iss": "https://shared-idp.example.com",
@@ -1426,7 +1428,10 @@ async fn test_oidc_ssrf_block_and_cross_project_inline_jwks_isolation() {
     );
     let forged_input = format!("{hdr_b64}.{forged_claims_b64}");
     let forged_sig = kp_b.sign(forged_input.as_bytes());
-    let forged_jwt = format!("Bearer {forged_input}.{}", URL_SAFE_NO_PAD.encode(forged_sig.as_ref()));
+    let forged_jwt = format!(
+        "Bearer {forged_input}.{}",
+        URL_SAFE_NO_PAD.encode(forged_sig.as_ref())
+    );
 
     let (forged_st, _) = send_json(
         &app,
@@ -1440,7 +1445,10 @@ async fn test_oidc_ssrf_block_and_cross_project_inline_jwks_isolation() {
 
     // Legitimate token signed with kp_a succeeds 200 OK
     let valid_sig = kp_a.sign(forged_input.as_bytes());
-    let valid_jwt = format!("Bearer {forged_input}.{}", URL_SAFE_NO_PAD.encode(valid_sig.as_ref()));
+    let valid_jwt = format!(
+        "Bearer {forged_input}.{}",
+        URL_SAFE_NO_PAD.encode(valid_sig.as_ref())
+    );
     let (ok_st, ok_body) = send_json(
         &app,
         Method::GET,
@@ -1514,7 +1522,8 @@ async fn test_audit_log_anchor_detects_tail_truncation_and_full_wipe() {
     // truncating the live or offline DB without updating the HMAC-protected anchor)!
     {
         let (_, _, audit_key) = sovereign_vault::crypto::unwrap_envelope(&key_arr, &hdr).unwrap();
-        let storage = sovereign_vault::storage::Storage::open_encrypted(dir.path(), &db_key).unwrap();
+        let storage =
+            sovereign_vault::storage::Storage::open_encrypted(dir.path(), &db_key).unwrap();
         let (valid_after_tail_delete, _, _) =
             storage.verify_and_list_audit_log(&audit_key, 50).unwrap();
         assert!(
@@ -1523,7 +1532,7 @@ async fn test_audit_log_anchor_detects_tail_truncation_and_full_wipe() {
         );
     }
 
-    // Also unseal and corrupt `vault.audit_anchor` while unsealed -> `/v1/sys/audit` MUST return `chain_verified == false`
+    // SV-AUD-01: Unsealing after an offline tail-truncation MUST NOT overwrite/heal vault.audit_anchor!
     let (unseal_st, _) = send_json(
         &app,
         Method::POST,
@@ -1533,6 +1542,20 @@ async fn test_audit_log_anchor_detects_tail_truncation_and_full_wipe() {
     )
     .await;
     assert_eq!(unseal_st, StatusCode::OK);
+
+    let (aud_post_unseal_st, aud_post_unseal_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/sys/audit",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(aud_post_unseal_st, StatusCode::OK);
+    assert_eq!(
+        aud_post_unseal_body["chain_verified"], false,
+        "SV-AUD-01: sys.unseal MUST NOT heal/re-anchor a tail-truncated audit_log"
+    );
 
     std::fs::remove_file(&anchor_file).expect("delete anchor file to simulate attacker rollback");
     let (aud2_st, aud2_body) = send_json(
@@ -1661,4 +1684,287 @@ async fn test_online_rotate_unseal_key_invalidates_old_key_and_preserves_secrets
     assert_eq!(aud_st, StatusCode::OK);
     assert_eq!(aud_body["chain_verified"], true);
     let _ = envelope_path(dir.path());
+}
+
+#[tokio::test]
+async fn test_sv_aud_regressions_backup_rewrap_oidc_jti_nat64_glob_and_enroll() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use sovereign_vault::oidc::{claim_matches_pattern, is_disallowed_oidc_ip};
+    use std::net::IpAddr;
+
+    let (_dir, _state, app, old_unseal_key, admin_token) = bootstrap_test_vault().await;
+
+    // 1. SV-AUD-05: IPv6 NAT64 (64:ff9b::/96 and 64:ff9b:1::/48) & IPv4-compatible SSRF checks
+    let nat64_imds: IpAddr = "64:ff9b::a9fe:a9fe".parse().unwrap(); // 169.254.169.254
+    let nat64_rfc1918: IpAddr = "64:ff9b::0a00:0001".parse().unwrap(); // 10.0.0.1
+    let nat64_local: IpAddr = "64:ff9b:1::7f00:0001".parse().unwrap(); // 127.0.0.1
+    let public_v6: IpAddr = "2606:4700:4700::1111".parse().unwrap();
+    assert!(
+        is_disallowed_oidc_ip(nat64_imds, false, false),
+        "SV-AUD-05: NAT64 cloud metadata IP must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(nat64_rfc1918, false, false),
+        "SV-AUD-05: NAT64 RFC1918 IP must be blocked"
+    );
+    assert!(
+        is_disallowed_oidc_ip(nat64_local, false, false),
+        "SV-AUD-05: RFC 8215 NAT64 loopback IP must be blocked"
+    );
+    assert!(!is_disallowed_oidc_ip(public_v6, false, false));
+
+    // 2. SV-AUD-06: Backtracking glob matcher & cross-colon hierarchy delimiter protection
+    assert!(
+        claim_matches_pattern("aaab", "*a*ab"),
+        "SV-AUD-06: backtracking glob must match *a*ab against aaab"
+    );
+    assert!(claim_matches_pattern(
+        "repo:oakai-sec/vault:ref:refs/heads/main",
+        "repo:oakai-sec/*:ref:refs/heads/main"
+    ));
+    assert!(
+        !claim_matches_pattern(
+            "repo:oakai-sec/other:environment:prod:ref:refs/heads/main",
+            "repo:oakai-sec/*:ref:refs/heads/main"
+        ),
+        "SV-AUD-06: interior '*:' wildcard must not span across ':' claim delimiters"
+    );
+    assert!(
+        !claim_matches_pattern("repo:oakai\n/vault", "repo:*"),
+        "SV-AUD-06: control characters in claim values must be rejected"
+    );
+
+    // 3. SV-AUD-13: POST /v1/sys/enroll rejects ttl_seconds = 0 and ttl_seconds > 10 years
+    let (ttl0_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/enroll",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "ops",
+            "name": "zero-ttl-worker",
+            "allowed_paths": ["ops/*"],
+            "capabilities": ["read"],
+            "ttl_seconds": 0
+        })),
+    )
+    .await;
+    assert_eq!(
+        ttl0_st,
+        StatusCode::BAD_REQUEST,
+        "SV-AUD-13: ttl_seconds=0 must be rejected with 400 Bad Request"
+    );
+
+    let (ttl_huge_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/enroll",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "ops",
+            "name": "huge-ttl-worker",
+            "allowed_paths": ["ops/*"],
+            "capabilities": ["read"],
+            "ttl_seconds": 9_999_999_999u64
+        })),
+    )
+    .await;
+    assert_eq!(ttl_huge_st, StatusCode::BAD_REQUEST);
+
+    // 4. SV-AUD-11: Uniform 401 error messages across unknown token_id and bad token secret
+    let (unk_st, unk_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[(
+            "X-Vault-Token",
+            "sv_live_11111111111111111111111111111111_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )],
+        None,
+    )
+    .await;
+    assert_eq!(unk_st, StatusCode::UNAUTHORIZED);
+
+    // Extract admin_token's valid ID and pair it with a wrong secret
+    let parts: Vec<&str> = admin_token.split('_').collect();
+    let valid_id_bad_secret = format!(
+        "sv_live_{}_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        parts[2]
+    );
+    let (bad_sec_st, bad_sec_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("X-Vault-Token", &valid_id_bad_secret)],
+        None,
+    )
+    .await;
+    assert_eq!(bad_sec_st, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unk_body["error"], bad_sec_body["error"],
+        "SV-AUD-11: unknown token_id and bad secret must return identical error message"
+    );
+
+    // 5. SV-AUD-02 & SV-AUD-14: Backup includes sys.backup in its own audit log & KEK rotation re-wraps backup envelopes
+    let (bk_st, bk_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/backup",
+        &[("X-Vault-Token", &admin_token)],
+        None,
+    )
+    .await;
+    assert_eq!(bk_st, StatusCode::CREATED);
+    let backup_dir = std::path::PathBuf::from(bk_body["backup_dir"].as_str().unwrap());
+
+    // Rotate the unseal key online
+    let (rot_st, rot_body) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/rotate-unseal-key",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({ "current_unseal_key": old_unseal_key })),
+    )
+    .await;
+    assert_eq!(rot_st, StatusCode::OK);
+    let new_unseal_key = rot_body["new_unseal_key"].as_str().unwrap().to_string();
+
+    // Verify that the backup snapshot's vault.envelope can NO LONGER be unwrapped with old_unseal_key,
+    // and CAN be unwrapped with new_unseal_key (`SV-AUD-02`)!
+    let backup_hdr = sovereign_vault::storage::read_envelope_header(&backup_dir).unwrap();
+    let old_bytes = sovereign_vault::crypto::hex_decode(&old_unseal_key).unwrap();
+    let mut old_arr = [0u8; 32];
+    old_arr.copy_from_slice(&old_bytes);
+    assert!(
+        sovereign_vault::crypto::unwrap_envelope(&old_arr, &backup_hdr).is_err(),
+        "SV-AUD-02: rotated-out unseal key must not unwrap historical backup envelopes"
+    );
+
+    let new_bytes = sovereign_vault::crypto::hex_decode(&new_unseal_key).unwrap();
+    let mut new_arr = [0u8; 32];
+    new_arr.copy_from_slice(&new_bytes);
+    let (bak_db_key, _, bak_audit_key) =
+        sovereign_vault::crypto::unwrap_envelope(&new_arr, &backup_hdr)
+            .expect("new unseal key must unwrap re-wrapped backup envelope");
+
+    // Verify `SV-AUD-14`: the backup DB's audit chain is verified and already contains `sys.backup`
+    let bak_storage =
+        sovereign_vault::storage::Storage::open_encrypted(&backup_dir, &bak_db_key).unwrap();
+    let (bak_chain_ok, _, bak_events) = bak_storage
+        .verify_and_list_audit_log(&bak_audit_key, 50)
+        .unwrap();
+    assert!(
+        bak_chain_ok,
+        "SV-AUD-14: backup snapshot audit chain + anchor must verify cleanly"
+    );
+    assert!(
+        bak_events.iter().any(|e| e.event_type == "sys.backup"),
+        "SV-AUD-14: backup snapshot must include its own sys.backup audit entry"
+    );
+
+    // 6. SV-AUD-03: OIDC JWT without `iat` exceeding max lifetime & `jti` replay protection
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+    let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let pub_b64 = URL_SAFE_NO_PAD.encode(kp.public_key().as_ref());
+    let inline_jwks = json!({
+        "keys": [{
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "kid": "aud-ed-1",
+            "alg": "EdDSA",
+            "use": "sig",
+            "x": pub_b64
+        }]
+    })
+    .to_string();
+
+    let (ob_st, _) = send_json(
+        &app,
+        Method::POST,
+        "/v1/sys/oidc/bindings",
+        &[("X-Vault-Token", &admin_token)],
+        Some(json!({
+            "project": "prod",
+            "name": "aud-oidc-worker",
+            "issuer": "https://oidc.aud.internal",
+            "audience": "sovereign-vault",
+            "subject_claim": "sub",
+            "subject_pattern": "system:serviceaccount:prod:*",
+            "allowed_paths": ["prod/*"],
+            "capabilities": ["read"],
+            "inline_jwks_json": inline_jwks
+        })),
+    )
+    .await;
+    assert_eq!(ob_st, StatusCode::CREATED);
+
+    let now = sovereign_vault::storage::now_unix_seconds();
+    let sign_jwt = |claims: serde_json::Value| -> String {
+        let hdr_b64 = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&json!({"alg": "EdDSA", "kid": "aud-ed-1"})).unwrap());
+        let pay_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{hdr_b64}.{pay_b64}");
+        let sig = kp.sign(signing_input.as_bytes());
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()))
+    };
+
+    // (a) JWT omitting `iat` with `exp = now + 90_000` (> 86400s) MUST be rejected (`SV-AUD-03`)
+    let long_lived_no_iat = sign_jwt(json!({
+        "iss": "https://oidc.aud.internal",
+        "sub": "system:serviceaccount:prod:api",
+        "aud": "sovereign-vault",
+        "exp": now + 90_000
+    }));
+    let (no_iat_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("Authorization", &format!("Bearer {long_lived_no_iat}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        no_iat_st,
+        StatusCode::UNAUTHORIZED,
+        "SV-AUD-03: OIDC JWT without iat exceeding 24h remaining lifetime must be rejected"
+    );
+
+    // (b) JWT with `jti` succeeds on first use and fails with 401 on replay (`SV-AUD-03`)
+    let jti_jwt = sign_jwt(json!({
+        "iss": "https://oidc.aud.internal",
+        "sub": "system:serviceaccount:prod:api",
+        "aud": "sovereign-vault",
+        "iat": now,
+        "exp": now + 600,
+        "jti": "unique-jwt-id-12345"
+    }));
+    let (first_st, _) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("Authorization", &format!("Bearer {jti_jwt}"))],
+        None,
+    )
+    .await;
+    assert_eq!(first_st, StatusCode::OK);
+
+    let (replay_st, replay_body) = send_json(
+        &app,
+        Method::GET,
+        "/v1/secrets",
+        &[("Authorization", &format!("Bearer {jti_jwt}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        replay_st,
+        StatusCode::UNAUTHORIZED,
+        "SV-AUD-03: Replaying an OIDC JWT with a consumed jti must fail with 401"
+    );
+    assert!(replay_body["error"]
+        .as_str()
+        .unwrap_or("")
+        .contains("replay"));
 }

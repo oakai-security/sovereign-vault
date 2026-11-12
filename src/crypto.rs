@@ -451,9 +451,12 @@ pub fn mint_machine_token() -> (String, Zeroizing<String>, String) {
     (token_id, raw_token, hash_hex)
 }
 
-/// Parse a `sv_live_<id_hex>_<secret_hex>` bearer token into `(token_id, secret_bytes)`.
+/// Parse a `sv_live_<id_hex>_<secret_hex>` (or `sv_admin_<id_hex>_<secret_hex>`) bearer token into `(token_id, secret_bytes)`.
 pub fn parse_machine_token(raw_header: &str) -> Result<(String, Zeroizing<[u8; 32]>), ()> {
-    let body = raw_header.strip_prefix("sv_live_").ok_or(())?;
+    let body = raw_header
+        .strip_prefix("sv_live_")
+        .or_else(|| raw_header.strip_prefix("sv_admin_"))
+        .ok_or(())?;
     let (id_hex, sec_hex) = body.split_once('_').ok_or(())?;
     if id_hex.len() != 32 || sec_hex.len() != 64 {
         return Err(());
@@ -497,10 +500,15 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
     if s.len() % 2 != 0 {
         return Err(());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
-        .collect()
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let Ok(byte) = u8::from_str_radix(&s[i..i + 2], 16) else {
+            out.zeroize();
+            return Err(());
+        };
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 /// Convert Unix epoch days (`days_since_1970`) into Gregorian `(year, month, day)`.
@@ -581,11 +589,10 @@ pub fn build_strict_tls13_server_config(
     let priv_key = PrivateKeyDer::from_pem_slice(key_pem)
         .map_err(|e| format!("Failed parsing TLS private key PEM: {e}"))?;
 
-    let mut cfg =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, priv_key)
-            .map_err(|e| format!("Failed constructing strict TLS 1.3 ServerConfig: {e}"))?;
+    let mut cfg = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certs, priv_key)
+        .map_err(|e| format!("Failed constructing strict TLS 1.3 ServerConfig: {e}"))?;
     cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(cfg))
 }
